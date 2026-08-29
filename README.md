@@ -66,6 +66,61 @@ make win64 WINCC=gcc
 - `--bench` measures prefill and decode throughput.
 - `--dump-logits` writes prompt logits as float32 binary data.
 
+## HTTP server
+
+`server.c` wraps the runtime in a minimal OpenAI-style chat completions endpoint: just
+enough HTTP, SSE, and JSON for coding harnesses such as [OpenCode](https://opencode.ai)
+and [Pi](https://github.com/earendil-works/pi), with tool calling prompted through the
+chat template and translated to the standard `tools`/`tool_calls` wire format.
+
+```bash
+make server
+./server -m ./gemma4-E2B-int8.bin -p 8080
+```
+
+The only endpoint is streaming `POST /v1/chat/completions`. Requests are served one at a
+time, and the KV cache carries over between requests that share a token prefix, so a
+growing agent conversation avoids re-prefilling its history each turn.
+
+OpenCode (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "provider": {
+    "gemma4c": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "gemma4.c",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "gemma4": { "name": "Gemma 4 E2B (local)", "limit": { "context": 131072, "output": 4096 } }
+      }
+    }
+  }
+}
+```
+
+Pi (`~/.pi/agent/models.json`):
+
+```json
+{
+  "providers": {
+    "gemma4c": {
+      "name": "gemma4.c",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "unused",
+      "models": [
+        { "id": "gemma4", "name": "Gemma 4 E2B (local)", "contextWindow": 131072, "maxTokens": 4096 }
+      ]
+    }
+  }
+}
+```
+
+Then select `gemma4c/gemma4` in OpenCode's `/models`, or run
+`pi --provider gemma4c --model gemma4`. Expect small-model results: the protocol round
+trip works, but a 2B model is a weak coding agent.
+
 ## Model
 
 The C runtime cannot read the original checkpoint directly. `exporter.py` takes the tokenizer and language-model weights from the Hugging Face checkpoint and writes them in the exact layout used by `gemma4.c`.
@@ -113,6 +168,7 @@ python3 validation.py 64
 ## Repository contents
 
 - `gemma4.c` contains the tokenizer, model definitions, kernels, transformer, KV cache, and generation loop.
+- `server.c` serves the runtime over a minimal OpenAI-style streaming chat completions API with tool calling.
 - `exporter.py` converts the original checkpoint into the binary layout read by the C runtime.
 - `validation.py` compares the runtime's logits with Hugging Face Transformers.
 - `validation.txt` contains the WikiText-103 passage used for numerical validation.

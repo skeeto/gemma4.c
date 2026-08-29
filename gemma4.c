@@ -651,10 +651,10 @@ int sample(float *logits, int vocab_size, float temperature) {
     return top[count - 1].token;
 }
 
-void prefill(Model *model, InferenceState *state, const int *tokens, int token_count, int dump_logits) {
-    for (int position = 0; position < token_count; position += BATCH_SIZE) {
-        int chunk = token_count - position < BATCH_SIZE ? token_count - position : BATCH_SIZE;
-        forward(model, state, tokens + position, chunk, position);
+void prefill(Model *model, InferenceState *state, const int *tokens, int token_count, int start_pos, int dump_logits) {
+    for (int offset = 0; offset < token_count; offset += BATCH_SIZE) {
+        int chunk = token_count - offset < BATCH_SIZE ? token_count - offset : BATCH_SIZE;
+        forward(model, state, tokens + offset, chunk, start_pos + offset);
         if (dump_logits) {
             for (int i = 0; i < chunk; i++) {
                 fwrite(logits(model, state, i), sizeof(float), VOCAB_SIZE, stdout);
@@ -685,7 +685,7 @@ void generate(Model *model, InferenceState *state, const char *prompt,
         fflush(stdout);
     }
 
-    prefill(model, state, state->token_ids, prompt_tokens, dump_logits);
+    prefill(model, state, state->token_ids, prompt_tokens, 0, dump_logits);
     if (dump_logits) return;
 
     int end = prompt_tokens + max_new_tokens;
@@ -723,7 +723,7 @@ void benchmark(Model *model, InferenceState *state, int prefill_tokens, int gene
         for (int i = 0; i < prefill_tokens; i++)
             state->token_ids[i] = 2 + i % 1000;
         double start = time_seconds();
-        prefill(model, state, state->token_ids, prefill_tokens, 0);
+        prefill(model, state, state->token_ids, prefill_tokens, 0, 0);
         printf("pp%d %.2f tok/s\n", prefill_tokens, (double)prefill_tokens / (time_seconds() - start));
     }
     if (generated_tokens > 0) {
@@ -737,6 +737,24 @@ void benchmark(Model *model, InferenceState *state, int prefill_tokens, int gene
     }
 }
 
+// Memory-maps a model file and rewrites its stored tensor offsets into pointers.
+Model *load_model(const char *path) {
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st)) { perror(path); return NULL; }
+    Model *model = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (model == MAP_FAILED) { perror("mmap"); return NULL; }
+    if (memcmp(model->magic, "MOG", 4) != 0) { fprintf(stderr, "%s: bad model file\n", path); return NULL; }
+    Tensor *tensors = (Tensor *)&model->weights;
+    for (size_t i = 0; i < sizeof(model->weights) / sizeof(*tensors); i++) {
+        tensors[i].data = tensors[i].data ? (void *)((uint8_t *)model + (uintptr_t)tensors[i].data) : NULL;
+        tensors[i].scales = tensors[i].scales ? (uint16_t *)((uint8_t *)model + (uintptr_t)tensors[i].scales) : NULL;
+    }
+    return model;
+}
+
+#ifndef GEMMA4_LIB
 int main(int argc, char **argv) {
 #ifdef _WIN32
     argv_utf8(&argc, &argv);
@@ -763,28 +781,17 @@ int main(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
     if (dump_logits) _setmode(_fileno(stdout), _O_BINARY);
 #endif
-    int fd = open(model_path, O_RDONLY);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st)) { perror(model_path); return 1; }
-    Model *model = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (model == MAP_FAILED) { perror("mmap"); return 1; }
-
-    if (memcmp(model->magic, "MOG", 4) != 0) { fprintf(stderr, "bad model file\n"); return 1; }
-    Tensor *tensors = (Tensor *)&model->weights;
-    for (size_t i = 0; i < sizeof(model->weights) / sizeof(*tensors); i++) {
-        tensors[i].data = tensors[i].data ? (void *)((uint8_t *)model + (uintptr_t)tensors[i].data) : NULL;
-        tensors[i].scales = tensors[i].scales ? (uint16_t *)((uint8_t *)model + (uintptr_t)tensors[i].scales) : NULL;
-    }
+    Model *model = load_model(model_path);
+    if (!model) return 1;
     InferenceState *state = calloc(1, sizeof(*state));
 
     rng_state = (unsigned long long)(time_seconds() * 1e9);
     if (benchmark_mode) benchmark(model, state, prefill_tokens, generated_tokens);
     else generate(model, state, prompt, max_new_tokens, temperature, dump_logits);
     free(state);
-    munmap(model, (size_t)st.st_size);
     return 0;
 }
+#endif // GEMMA4_LIB
 
 //      |\__/,|   (`\_
 //    *.|o o  |*   ) )

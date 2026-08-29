@@ -13,9 +13,12 @@ endif
 run: gemma4.c
 	$(CC) $(CFLAGS) gemma4.c -o run $(LDFLAGS)
 
+server: server.c gemma4.c
+	$(CC) $(CFLAGS) server.c -o server $(LDFLAGS)
+
 win64: gemma4.c win.c win.h
 	$(WINCC) -std=c11 -O3 -Wall -Wextra -march=native -fopenmp -static -D_WIN32 gemma4.c win.c -o run.exe -lm -lshell32
 
 .PHONY: clean win64
 clean:
-	rm -f run run.exe
+	rm -f run run.exe server
