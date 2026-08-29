@@ -17,13 +17,15 @@ Measured on an AMD Ryzen 7 7700 using the default native build.
 
 Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup, with each runtime using its fastest tested thread count. Both were built natively for CPU and dynamically quantize matrix inputs to int8.
 
+On an Apple M4 Max, the NEON build measures 637.62 ± 14.31 tok/s prefill and 25.06 ± 0.09 tok/s decode under the same protocol at the default thread count of one per performance core. Decode reaches about 29 tok/s with `OMP_NUM_THREADS=10`, which trades a little prefill throughput.
+
 ```bash
 ./run -m ./gemma4-E2B-int8.bin --bench 512 128
 ```
 
 ## Quick start
 
-You need a CPU with AVX2, an OpenMP-capable C compiler, and `make`. The model takes about 5.0 GB of disk space, and 8 GB of RAM is recommended.
+You need a CPU with AVX2 or ARM NEON dot product instructions (any Apple Silicon Mac), an OpenMP-capable C compiler, and `make`. The model takes about 5.0 GB of disk space, and 8 GB of RAM is recommended.
 
 Clone the repository and download the ready-to-run model:
 
@@ -37,6 +39,14 @@ hf download QmogAI/gemma4-e2b-int8 gemma4-E2B-int8.bin --local-dir .
 On Linux:
 
 ```bash
+make
+./run -t 0 -n 256 "Why is the sky blue?"
+```
+
+On macOS, Apple's compiler needs Homebrew's OpenMP runtime:
+
+```bash
+brew install libomp
 make
 ./run -t 0 -n 256 "Why is the sky blue?"
 ```
@@ -107,4 +117,4 @@ python3 validation.py 64
 - `validation.py` compares the runtime's logits with Hugging Face Transformers.
 - `validation.txt` contains the WikiText-103 passage used for numerical validation.
 - `win.c` and `win.h` provide the small Windows memory-mapping compatibility layer.
-- `Makefile` builds the Linux or Windows executable.
+- `Makefile` builds the Linux, macOS, or Windows executable.

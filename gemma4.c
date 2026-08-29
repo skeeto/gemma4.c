@@ -1,4 +1,4 @@
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__) // macOS keeps its default namespace because sysctl needs the BSD types that _POSIX_C_SOURCE hides.
 #define _POSIX_C_SOURCE 200809L
 #endif
 
@@ -19,9 +19,17 @@
 #include <unistd.h>
 #endif
 
-#include <cpuid.h>
 #include <omp.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <cpuid.h>
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 #define NUM_LAYERS 35
 #define HIDDEN_SIZE 1536
@@ -182,11 +190,32 @@ _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && 
 
 // Uses one OpenMP thread per physical core because each core already uses SIMD, unless OMP_NUM_THREADS overrides it.
 static inline int thread_count(void) {
+    if (getenv("OMP_NUM_THREADS")) return omp_get_max_threads();
+#if defined(__x86_64__) || defined(_M_X64)
     unsigned int eax, ebx, ecx, edx;
     __cpuid_count(0xB, 0, eax, ebx, ecx, edx);
-    int logical_cpus = omp_get_num_procs();
     int threads_per_core = ebx & 0xffff;
-    return getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : logical_cpus / (threads_per_core ? threads_per_core : 1);
+    return omp_get_num_procs() / (threads_per_core ? threads_per_core : 1);
+#elif defined(__APPLE__)
+    int performance_cores = 0; // Efficiency cores would stall the static OpenMP schedules, so use only performance cores.
+    size_t size = sizeof(performance_cores);
+    if (!sysctlbyname("hw.perflevel0.logicalcpu", &performance_cores, &size, NULL, 0) && performance_cores > 0)
+        return performance_cores;
+    return omp_get_num_procs();
+#else
+    return omp_get_num_procs();
+#endif
+}
+
+// Weight scales are stored as IEEE half-precision floats.
+static inline float half_to_float(uint16_t bits) {
+#if defined(__ARM_NEON)
+    __fp16 value;
+    memcpy(&value, &bits, sizeof(value));
+    return (float)value;
+#else
+    return _cvtsh_ss(bits);
+#endif
 }
 
 // Multiplies dynamically quantized activations by packed int8 weights in blocks of 16
@@ -222,6 +251,43 @@ static inline __attribute__((always_inline)) void matmul_block(
         }
         for (size_t row = 0; row < active_rows; row++)
             _mm512_storeu_ps(output + (row_start + row) * weight->shape[0] + output_block * block_rows, result[row]);
+    }
+}
+#elif defined(__ARM_NEON)
+static inline __attribute__((always_inline)) void matmul_block(
+    float *output, const int8_t *input_q, const float *input_scales,
+    const Tensor *weight, size_t rows, size_t output_block) {
+    const size_t block_rows = 16;
+    size_t groups_per_row = (size_t)weight->shape[1] / 64;
+    const int8_t *packed_weights = (const int8_t *)weight->data + output_block * block_rows * weight->shape[1];
+    for (size_t row_start = 0; row_start < rows; row_start += 4) {
+        size_t active_rows = rows - row_start < 4 ? rows - row_start : 4;
+        float32x4_t result[4][4] = {0};
+        for (size_t group = 0; group < groups_per_row; group++) {
+            int32x4_t dot[4][4] = {0};
+            for (int chunk = 0; chunk < 16; chunk++) {
+                int8x16_t weight_values[4]; // Each vector holds four consecutive input values for four of the sixteen output rows.
+                for (int quad = 0; quad < 4; quad++)
+                    weight_values[quad] = vld1q_s8(packed_weights + group * 1024 + chunk * 64 + quad * 16);
+                for (size_t row = 0; row < active_rows; row++) {
+                    int32_t input_word;
+                    memcpy(&input_word, input_q + (row_start + row) * weight->shape[1] + group * 64 + chunk * 4, sizeof(input_word));
+                    int8x16_t input_values = vreinterpretq_s8_s32(vdupq_n_s32(input_word));
+                    for (int quad = 0; quad < 4; quad++)
+                        dot[row][quad] = vdotq_s32(dot[row][quad], weight_values[quad], input_values);
+                }
+            }
+            const float16_t *scale_halves = (const float16_t *)(weight->scales + (output_block * groups_per_row + group) * block_rows);
+            for (size_t row = 0; row < active_rows; row++) {
+                float32x4_t input_scale = vdupq_n_f32(input_scales[(row_start + row) * groups_per_row + group]);
+                for (int quad = 0; quad < 4; quad++)
+                    result[row][quad] = vfmaq_f32(result[row][quad], vcvtq_f32_s32(dot[row][quad]),
+                                                  vmulq_f32(vcvt_f32_f16(vld1_f16(scale_halves + quad * 4)), input_scale));
+            }
+        }
+        for (size_t row = 0; row < active_rows; row++)
+            for (int quad = 0; quad < 4; quad++)
+                vst1q_f32(output + (row_start + row) * weight->shape[0] + output_block * block_rows + quad * 4, result[row][quad]);
     }
 }
 #else
@@ -282,6 +348,33 @@ void quantize(int8_t *quantized, float *scales, const float *input, size_t rows,
     }
 }
 
+#if defined(__ARM_NEON)
+void attention_scores(float *scores, const float *query, const float *key_cache,
+        int first_key, int num_keys, int cache_mask, int head_dim) {
+    for (int key_index = 0; key_index < num_keys; key_index++) {
+        const float *key = key_cache + ((first_key + key_index) & cache_mask) * head_dim;
+        float32x4_t sum[4] = {0};
+        for (int j = 0; j < head_dim; j += 16)
+            for (int u = 0; u < 4; u++)
+                sum[u] = vfmaq_f32(sum[u], vld1q_f32(query + j + u * 4), vld1q_f32(key + j + u * 4));
+        scores[key_index] = vaddvq_f32(vaddq_f32(vaddq_f32(sum[0], sum[1]), vaddq_f32(sum[2], sum[3])));
+    }
+}
+
+void weighted_value_sum(float *output, const float *probabilities, const float *value_cache,
+        int first_key, int num_keys, int cache_mask, int head_dim) {
+    for (int j = 0; j < head_dim; j += 32) {
+        float32x4_t sum[8] = {0};
+        for (int key_index = 0; key_index < num_keys; key_index++) {
+            const float *value = value_cache + ((first_key + key_index) & cache_mask) * head_dim + j;
+            float32x4_t probability = vdupq_n_f32(probabilities[key_index]);
+            for (int u = 0; u < 8; u++)
+                sum[u] = vfmaq_f32(sum[u], probability, vld1q_f32(value + u * 4));
+        }
+        for (int u = 0; u < 8; u++) vst1q_f32(output + j + u * 4, sum[u]);
+    }
+}
+#else
 void attention_scores(float *scores, const float *query, const float *key_cache,
         int first_key, int num_keys, int cache_mask, int head_dim) {
     for (int key_index = 0; key_index < num_keys; key_index++) {
@@ -311,6 +404,7 @@ void weighted_value_sum(float *output, const float *probabilities, const float *
         for (int u = 0; u < 8; u++) _mm256_storeu_ps(output + j + u * 8, sum[u]);
     }
 }
+#endif
 
 // Approximates GELU from the exported lookup table and multiplies it by the up projection to produce the MLP's gated activation.
 void geglu(float *gate, const float *up, int rows, int width, int up_stride, const Tensor *gelu_table) {
@@ -353,7 +447,7 @@ void embedding(float *output, const Tensor *table, const int *tokens, size_t tok
         const uint16_t *block_scales = table->scales + block * groups * block_rows;
         for (size_t group_index = 0; group_index < (size_t)groups; group_index++) {
             const int8_t *group = block_data + group_index * block_rows * 64;
-            float scale = _cvtsh_ss(block_scales[group_index * block_rows + row]) * multiplier;
+            float scale = half_to_float(block_scales[group_index * block_rows + row]) * multiplier;
             for (int j = 0; j < 64; j++) {
                 int chunk = j / 4;
                 int offset = j % 4;
