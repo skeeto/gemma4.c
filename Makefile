@@ -16,9 +16,15 @@ run: gemma4.c
 server: server.c gemma4.c
 	$(CC) $(CFLAGS) server.c -o server $(LDFLAGS)
 
+run-e4b: gemma4.c
+	$(CC) $(CFLAGS) -DGEMMA4_E4B gemma4.c -o run-e4b $(LDFLAGS)
+
+server-e4b: server.c gemma4.c
+	$(CC) $(CFLAGS) -DGEMMA4_E4B server.c -o server-e4b $(LDFLAGS)
+
 win64: gemma4.c win.c win.h
 	$(WINCC) -std=c11 -O3 -Wall -Wextra -march=native -fopenmp -static -D_WIN32 gemma4.c win.c -o run.exe -lm -lshell32
 
 .PHONY: clean win64
 clean:
-	rm -f run run.exe server
+	rm -f run run.exe server run-e4b server-e4b

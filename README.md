@@ -17,7 +17,7 @@ Measured on an AMD Ryzen 7 7700 using the default native build.
 
 Results are the mean ± sample standard deviation over 12 timed runs after one discarded warmup, with each runtime using its fastest tested thread count. Both were built natively for CPU and dynamically quantize matrix inputs to int8.
 
-On an Apple M4 Max, the NEON build measures 637.62 ± 14.31 tok/s prefill and 25.06 ± 0.09 tok/s decode under the same protocol at the default thread count of one per performance core. Decode reaches about 29 tok/s with `OMP_NUM_THREADS=10`, which trades a little prefill throughput.
+On an Apple M4 Max, the NEON build measures 637.62 ± 14.31 tok/s prefill and 25.06 ± 0.09 tok/s decode under the same protocol at the default thread count of one per performance core. Decode reaches about 29 tok/s with `OMP_NUM_THREADS=10`, which trades a little prefill throughput. The E4B build measures roughly 333 tok/s prefill and 14.6 tok/s decode on the same machine.
 
 ```bash
 ./run -m ./gemma4-E2B-int8.bin --bench 512 128
@@ -126,6 +126,12 @@ trip works, but a 2B model is a weak coding agent.
 The C runtime cannot read the original checkpoint directly. `exporter.py` takes the tokenizer and language-model weights from the Hugging Face checkpoint and writes them in the exact layout used by `gemma4.c`.
 
 Matrix weights are stored as int8 with FP16 scales. Inputs to linear layers are dynamically quantized to int8 while the rest of the activations remain float32. The resulting file is about 5.0 GB (4.7 GiB).
+
+The larger Gemma 4 E4B checkpoint is also supported. The compiled-in architecture must
+match the model file, so build the E4B runtime and server as `make run-e4b server-e4b`,
+then export [google/gemma-4-E4B-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-unquantized)
+to `gemma4-E4B-int8.bin` (about 7.4 GiB) with the same exporter command. E4B validates at
+96.9% top-1 agreement over 256 positions.
 
 To create it yourself instead:
 

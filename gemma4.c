@@ -31,8 +31,25 @@
 #include <sys/sysctl.h>
 #endif
 
+// The compiled-in architecture must match the exported checkpoint. E2B is the
+// default; build with -DGEMMA4_E4B for the E4B checkpoint.
+#ifdef GEMMA4_E4B
+#define MODEL_FILE "gemma4-E4B-int8.bin"
+#define NUM_LAYERS 42
+#define HIDDEN_SIZE 2560
+#define FULL_INTERVAL 6  // Every sixth layer uses full attention.
+#define CACHE_SETS 4     // KV-writing full-attention layers: 5, 11, 17, 23.
+#define SLIDING_KV 512   // Two KV heads of 256 channels.
+#define FULL_KV 1024     // Two KV heads of 512 channels.
+#else
+#define MODEL_FILE "gemma4-E2B-int8.bin"
 #define NUM_LAYERS 35
 #define HIDDEN_SIZE 1536
+#define FULL_INTERVAL 5  // Every fifth layer uses full attention.
+#define CACHE_SETS 3     // KV-writing full-attention layers: 4, 9, 14.
+#define SLIDING_KV 256   // One KV head of 256 channels.
+#define FULL_KV 512      // One KV head of 512 channels.
+#endif
 #define VOCAB_SIZE 262144
 #define MAX_CONTEXT 131072
 #define SLIDING_WINDOW 512
@@ -165,14 +182,14 @@ typedef struct {
 } ModelWeights;
 
 typedef struct {
-    float residual[BATCH_SIZE * HIDDEN_SIZE];                           // Carries each token's hidden state through all 35 layers.
-    float hidden[BATCH_SIZE * 8 * HIDDEN_SIZE];                         // Reused for intermediate results and sized for the largest 12,288-value MLP output.
+    float residual[BATCH_SIZE * HIDDEN_SIZE];                           // Carries each token's hidden state through every layer.
+    float hidden[BATCH_SIZE * 8 * HIDDEN_SIZE];                         // Reused for intermediate results and sized for the largest MLP output.
     float auxiliary[BATCH_SIZE * 8 * HIDDEN_SIZE];                      // Holds a second intermediate when attention or the MLP needs two results at once.
     int8_t quantized[BATCH_SIZE * 8 * HIDDEN_SIZE];                     // Holds the current linear input after dynamic int8 quantization.
     float activation_scales[BATCH_SIZE * 8 * HIDDEN_SIZE / 64];         // Stores one float scale for every 64 quantized values.
     float per_layer_inputs[BATCH_SIZE * NUM_LAYERS * 256];              // Stores one 256-value conditioning vector for every token and layer.
-    float sliding_cache[3][4][2 * (SLIDING_WINDOW + BATCH_SIZE) * 256]; // Keeps the previous window and current batch for twelve sliding KV caches.
-    float full_cache[3][2 * MAX_CONTEXT * 512];                         // Holds the complete context for three 512-wide full-attention KV caches.
+    float sliding_cache[CACHE_SETS][FULL_INTERVAL - 1][2 * (SLIDING_WINDOW + BATCH_SIZE) * SLIDING_KV]; // Keeps the previous window and current batch for the sliding KV caches.
+    float full_cache[CACHE_SETS][2 * MAX_CONTEXT * FULL_KV];            // Holds the complete context for the full-attention KV caches.
     int token_ids[MAX_CONTEXT];                                         // Holds the tokenized prompt before prefill.
 } InferenceState;
 
@@ -183,7 +200,7 @@ typedef struct {
 } Model;
 
 // Verifies that the compiler laid out the memory-mapped model exactly as the exporter expects.
-_Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && sizeof(VocabEntry) == 100 && offsetof(VocabEntry, id) == 96 && sizeof(LookupEntry) == 16 && sizeof(Tokenizer) == 33429932 && sizeof(Tensor) == 32 && sizeof(ModelWeights) == 21472 && sizeof(Model) == 33451408 && offsetof(Model, weights) == 33429936 && BATCH_SIZE == SLIDING_WINDOW && !((SLIDING_WINDOW + BATCH_SIZE) & (SLIDING_WINDOW + BATCH_SIZE - 1)) && !(MAX_CONTEXT & (MAX_CONTEXT - 1)), "MOG ABI mismatch");
+_Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(void *) == 8 && sizeof(VocabEntry) == 100 && offsetof(VocabEntry, id) == 96 && sizeof(LookupEntry) == 16 && sizeof(Tokenizer) == 33429932 && sizeof(Tensor) == 32 && sizeof(ModelWeights) == (6 + 19 * NUM_LAYERS) * sizeof(Tensor) && offsetof(Model, weights) == 33429936 && sizeof(Model) == offsetof(Model, weights) + sizeof(ModelWeights) && BATCH_SIZE == SLIDING_WINDOW && !((SLIDING_WINDOW + BATCH_SIZE) & (SLIDING_WINDOW + BATCH_SIZE - 1)) && !(MAX_CONTEXT & (MAX_CONTEXT - 1)), "MOG ABI mismatch");
 
 // ----------------------------------------------------------------------------
 // Kernels
@@ -348,11 +365,13 @@ void quantize(int8_t *quantized, float *scales, const float *input, size_t rows,
     }
 }
 
+// The caches interleave every KV head's channels per position, so entries are
+// cache_stride floats apart while each head's slice spans head_dim of them.
 #if defined(__ARM_NEON)
 void attention_scores(float *scores, const float *query, const float *key_cache,
-        int first_key, int num_keys, int cache_mask, int head_dim) {
+        int first_key, int num_keys, int cache_mask, int head_dim, int cache_stride) {
     for (int key_index = 0; key_index < num_keys; key_index++) {
-        const float *key = key_cache + ((first_key + key_index) & cache_mask) * head_dim;
+        const float *key = key_cache + (size_t)((first_key + key_index) & cache_mask) * cache_stride;
         float32x4_t sum[4] = {0};
         for (int j = 0; j < head_dim; j += 16)
             for (int u = 0; u < 4; u++)
@@ -362,11 +381,11 @@ void attention_scores(float *scores, const float *query, const float *key_cache,
 }
 
 void weighted_value_sum(float *output, const float *probabilities, const float *value_cache,
-        int first_key, int num_keys, int cache_mask, int head_dim) {
+        int first_key, int num_keys, int cache_mask, int head_dim, int cache_stride) {
     for (int j = 0; j < head_dim; j += 32) {
         float32x4_t sum[8] = {0};
         for (int key_index = 0; key_index < num_keys; key_index++) {
-            const float *value = value_cache + ((first_key + key_index) & cache_mask) * head_dim + j;
+            const float *value = value_cache + (size_t)((first_key + key_index) & cache_mask) * cache_stride + j;
             float32x4_t probability = vdupq_n_f32(probabilities[key_index]);
             for (int u = 0; u < 8; u++)
                 sum[u] = vfmaq_f32(sum[u], probability, vld1q_f32(value + u * 4));
@@ -376,9 +395,9 @@ void weighted_value_sum(float *output, const float *probabilities, const float *
 }
 #else
 void attention_scores(float *scores, const float *query, const float *key_cache,
-        int first_key, int num_keys, int cache_mask, int head_dim) {
+        int first_key, int num_keys, int cache_mask, int head_dim, int cache_stride) {
     for (int key_index = 0; key_index < num_keys; key_index++) {
-        const float *key = key_cache + ((first_key + key_index) & cache_mask) * head_dim;
+        const float *key = key_cache + (size_t)((first_key + key_index) & cache_mask) * cache_stride;
         __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
         for (int j = 0; j < head_dim; j += 16) {
             sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(query + j), _mm256_loadu_ps(key + j), sum0);
@@ -392,11 +411,11 @@ void attention_scores(float *scores, const float *query, const float *key_cache,
 }
 
 void weighted_value_sum(float *output, const float *probabilities, const float *value_cache,
-        int first_key, int num_keys, int cache_mask, int head_dim) {
+        int first_key, int num_keys, int cache_mask, int head_dim, int cache_stride) {
     for (int j = 0; j < head_dim; j += 64) {
         __m256 sum[8] = {0};
         for (int key_index = 0; key_index < num_keys; key_index++) {
-            const float *value = value_cache + ((first_key + key_index) & cache_mask) * head_dim + j;
+            const float *value = value_cache + (size_t)((first_key + key_index) & cache_mask) * cache_stride + j;
             __m256 probability = _mm256_set1_ps(probabilities[key_index]);
             for (int u = 0; u < 8; u++)
                 sum[u] = _mm256_fmadd_ps(probability, _mm256_loadu_ps(value + u * 8), sum[u]);
@@ -510,15 +529,17 @@ void softmax(float *values, int count) {
 void attention(InferenceState *state, const LayerWeights *layers, int layer,
                int start_pos, size_t token_count, float *scores) {
     const LayerWeights *weights = &layers[layer];
-    int full_attention = layer % 5 == 4; // Every fifth layer uses full attention.
+    int full_attention = layer % FULL_INTERVAL == FULL_INTERVAL - 1;
     int cache_len = full_attention ? MAX_CONTEXT : SLIDING_WINDOW + BATCH_SIZE;
     int cache_mask = cache_len - 1; // Both cache lengths are powers of two, so masking wraps positions without division.
     int head_dim = weights->q_norm.shape[0];
     int query_width = weights->q_proj.shape[0];
     int cache_owner = layer;
-    while (!layers[cache_owner].k_proj.data || (cache_owner % 5 == 4) != full_attention) cache_owner--; // Shared layers reuse the latest cache of the same attention type.
-    float *key_cache = full_attention ? state->full_cache[cache_owner / 5] : state->sliding_cache[cache_owner / 5][cache_owner % 5];
-    float *value_cache = key_cache + (size_t)cache_len * head_dim;
+    while (!layers[cache_owner].k_proj.data || (cache_owner % FULL_INTERVAL == FULL_INTERVAL - 1) != full_attention) cache_owner--; // Shared layers reuse the latest cache of the same attention type.
+    int kv_width = layers[cache_owner].k_proj.shape[0]; // Every KV head's channels, interleaved per cache position.
+    int kv_heads = kv_width / head_dim;
+    float *key_cache = full_attention ? state->full_cache[cache_owner / FULL_INTERVAL] : state->sliding_cache[cache_owner / FULL_INTERVAL][cache_owner % FULL_INTERVAL];
+    float *value_cache = key_cache + (size_t)cache_len * kv_width;
 
     quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->q_proj.shape[1]);
     matmul_int8(state->auxiliary, state->quantized, state->activation_scales, &weights->q_proj, token_count);
@@ -526,13 +547,13 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
     apply_rope(&weights->rope_cos, &weights->rope_sin, state->auxiliary, query_width / head_dim, head_dim, start_pos, token_count);
 
     if (weights->k_proj.data) {
-        float *new_keys = key_cache + ((size_t)start_pos & cache_mask) * head_dim;
-        float *new_values = value_cache + ((size_t)start_pos & cache_mask) * head_dim;
+        float *new_keys = key_cache + ((size_t)start_pos & cache_mask) * kv_width;
+        float *new_values = value_cache + ((size_t)start_pos & cache_mask) * kv_width;
         matmul_int8(new_keys, state->quantized, state->activation_scales, &weights->k_proj, token_count);
         matmul_int8(new_values, state->quantized, state->activation_scales, &weights->v_proj, token_count);
-        rmsnorm(new_keys, new_keys, &weights->k_norm, head_dim, 1e-6f, token_count);
-        rmsnorm(new_values, new_values, NULL, head_dim, 1e-6f, token_count); // Value vectors are normalized without a learned weight.
-        apply_rope(&weights->rope_cos, &weights->rope_sin, new_keys, 1, head_dim, start_pos, token_count);
+        rmsnorm(new_keys, new_keys, &weights->k_norm, head_dim, 1e-6f, token_count * kv_heads);
+        rmsnorm(new_values, new_values, NULL, head_dim, 1e-6f, token_count * kv_heads); // Value vectors are normalized without a learned weight.
+        apply_rope(&weights->rope_cos, &weights->rope_sin, new_keys, kv_heads, head_dim, start_pos, token_count);
     }
 
     #pragma omp for collapse(2) schedule(dynamic, 1)
@@ -540,11 +561,12 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
         for (size_t token = 0; token < token_count; token++) {
             int first_key = !full_attention && start_pos + (int)token + 1 > SLIDING_WINDOW ? start_pos + (int)token + 1 - SLIDING_WINDOW : 0;
             int num_keys = start_pos + (int)token + 1 - first_key;
+            size_t kv_offset = head / (query_width / head_dim / kv_heads) * (size_t)head_dim; // Query heads share KV heads in contiguous groups.
             float *head_output = state->hidden + token * query_width + head * head_dim;
             const float *query = state->auxiliary + token * query_width + head * head_dim;
-            attention_scores(scores, query, key_cache, first_key, num_keys, cache_mask, head_dim);
+            attention_scores(scores, query, key_cache + kv_offset, first_key, num_keys, cache_mask, head_dim, kv_width);
             softmax(scores, num_keys);
-            weighted_value_sum(head_output, scores, value_cache, first_key, num_keys, cache_mask, head_dim);
+            weighted_value_sum(head_output, scores, value_cache + kv_offset, first_key, num_keys, cache_mask, head_dim, kv_width);
         }
     }
 
@@ -751,6 +773,10 @@ Model *load_model(const char *path) {
         tensors[i].data = tensors[i].data ? (void *)((uint8_t *)model + (uintptr_t)tensors[i].data) : NULL;
         tensors[i].scales = tensors[i].scales ? (uint16_t *)((uint8_t *)model + (uintptr_t)tensors[i].scales) : NULL;
     }
+    if (model->weights.embed.shape[0] != VOCAB_SIZE || model->weights.embed.shape[1] != HIDDEN_SIZE) {
+        fprintf(stderr, "%s: model was exported for a different Gemma 4 variant than this build\n", path);
+        return NULL;
+    }
     return model;
 }
 
@@ -759,7 +785,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     argv_utf8(&argc, &argv);
 #endif
-    const char *model_path = "gemma4-E2B-int8.bin";
+    const char *model_path = MODEL_FILE;
     const char *prompt = "Why is the sky blue?";
     float temperature = 1.0f;
     int max_new_tokens = 1024;

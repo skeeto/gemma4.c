@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export Gemma 4 E2B to the binary consumed by gemma4.c."""
+"""Export Gemma 4 E2B or E4B to the binary consumed by gemma4.c."""
 
 import argparse
 import json
@@ -14,8 +14,6 @@ import safetensors
 from tqdm import tqdm
 
 
-N_LAYERS = 35
-N_KV_LAYERS = 15
 TOKEN_MAX = 94
 VOCAB_MAX = 262144
 BYTE_TOKEN_BASE = 238
@@ -101,13 +99,17 @@ def text_tensors(weights, config):
             rope_cache[index] = tensor(weights, None, synthetic=tables[index])
         return rope_cache[index]
 
+    n_layers = config["num_hidden_layers"]
+    n_kv_layers = n_layers - config["num_kv_shared_layers"]
+    hidden = config["hidden_size"]
+    kv_heads = config["num_key_value_heads"]
     slots = [
         tensor(weights, "model.language_model.embed_tokens.weight"),
         tensor(weights, "model.language_model.embed_tokens_per_layer.weight"),
     ]
-    for layer in range(N_LAYERS):
+    for layer in range(n_layers):
         p = f"model.language_model.layers.{layer}."
-        shared_kv = layer < N_KV_LAYERS
+        writes_kv = layer < n_kv_layers
         rope_index = 0 if config["layer_types"][layer] == "sliding_attention" else 2
         layer_slots = [
             tensor(weights, p + "input_layernorm.weight"), tensor(weights, p + "layer_scalar"),
@@ -118,25 +120,27 @@ def text_tensors(weights, config):
             tensor(weights, p + "per_layer_input_gate.weight"),
             tensor(weights, p + "per_layer_projection.weight"),
             tensor(weights, p + "self_attn.q_norm.weight"),
-            tensor(weights, p + "self_attn.k_norm.weight") if shared_kv else None,
+            tensor(weights, p + "self_attn.k_norm.weight") if writes_kv else None,
             tensor(weights, p + "self_attn.q_proj.weight"),
-            tensor(weights, p + "self_attn.k_proj.weight") if shared_kv else None,
-            tensor(weights, p + "self_attn.v_proj.weight") if shared_kv else None,
+            tensor(weights, p + "self_attn.k_proj.weight") if writes_kv else None,
+            tensor(weights, p + "self_attn.v_proj.weight") if writes_kv else None,
             tensor(weights, p + "self_attn.o_proj.weight"),
             tensor(weights, p + "mlp.gate_proj.weight"),
             tensor(weights, p + "mlp.up_proj.weight"),
             tensor(weights, p + "mlp.down_proj.weight"),
             shared_rope(rope_index), shared_rope(rope_index + 1),
         ]
-        intermediate_size = 6144 if layer < N_KV_LAYERS else 12288
-        if (layer_slots[14]["shape"] != (intermediate_size, 1536)
-                or layer_slots[15]["shape"] != (intermediate_size, 1536)
-                or layer_slots[16]["shape"] != (1536, intermediate_size)):
+        intermediate_size = config["intermediate_size"] * (
+            2 if config["use_double_wide_mlp"] and layer >= n_kv_layers else 1)
+        if (layer_slots[14]["shape"] != (intermediate_size, hidden)
+                or layer_slots[15]["shape"] != (intermediate_size, hidden)
+                or layer_slots[16]["shape"] != (hidden, intermediate_size)):
             raise ValueError(f"unexpected MLP shapes in layer {layer}")
-        if shared_kv:
-            head_width = 512 if rope_index == 2 else 256
-            if (layer_slots[11]["shape"] != (head_width, 1536)
-                    or layer_slots[12]["shape"] != (head_width, 1536)):
+        if writes_kv:
+            head_width = kv_heads * (config["global_head_dim"] if rope_index == 2
+                                     else config["head_dim"])
+            if (layer_slots[11]["shape"] != (head_width, hidden)
+                    or layer_slots[12]["shape"] != (head_width, hidden)):
                 raise ValueError(f"unexpected K/V shapes in layer {layer}")
         slots += layer_slots
     gelu = tensor(weights, None, synthetic=gelu_table())
@@ -151,25 +155,21 @@ def text_tensors(weights, config):
 
 
 def validate_text_config(model):
+    """Checks the invariants gemma4.c hardcodes; sizes the runtime reads from
+    tensor shapes or per-variant constants are left to the checkpoint."""
     if model.get("model_type") != "gemma4":
         raise ValueError("checkpoint is not Gemma 4")
     text = model["text_config"]
-    if ((text["hidden_size"], text["vocab_size"], text["num_hidden_layers"],
-            text["num_hidden_layers"] - text["num_kv_shared_layers"],
-            text["num_key_value_heads"], text["head_dim"],
-            text["global_head_dim"], text["intermediate_size"],
-            text["use_double_wide_mlp"]) !=
-            (1536, VOCAB_MAX, N_LAYERS, N_KV_LAYERS, 1, 256, 512, 6144, True)):
-        raise ValueError("expected Gemma 4 E2B")
-    if (text["max_position_embeddings"], text["sliding_window"],
-            text["hidden_size_per_layer_input"]) != (131072, 512, 256):
-        raise ValueError("expected Gemma 4 E2B text configuration")
-    if (np.float32(text["rms_norm_eps"]) != np.float32(float.fromhex("0x1.0c6f7ap-20"))
+    if (text["vocab_size"], text["max_position_embeddings"], text["sliding_window"],
+            text["hidden_size_per_layer_input"]) != (VOCAB_MAX, 131072, 512, 256):
+        raise ValueError("unsupported Gemma 4 text configuration")
+    if (np.float32(text["rms_norm_eps"]) != np.float32(1e-6)
             or np.float32(text["final_logit_softcapping"]) != np.float32(30.0)):
-        raise ValueError("expected Gemma 4 E2B text configuration")
-    layer_types = ["sliding_attention"] * 4 + ["full_attention"]
-    if text["layer_types"] != layer_types * 7:
-        raise ValueError("expected Gemma 4 E2B attention sequence")
+        raise ValueError("unsupported Gemma 4 text configuration")
+    interval = text["layer_types"].index("full_attention") + 1
+    layer_types = ["sliding_attention"] * (interval - 1) + ["full_attention"]
+    if text["layer_types"] != layer_types * (text["num_hidden_layers"] // interval):
+        raise ValueError("unsupported Gemma 4 attention sequence")
     return text
 
 
@@ -333,6 +333,8 @@ def export(checkpoint_path, output_path):
     cursor = align64(HEADER_SIZE + TOKENIZER_SPAN + TEXT_TENSOR_SPAN)
     with safetensors.safe_open(weights_path, framework="pt") as weights:
         text = text_tensors(weights, text_config)
+        if len(text) * TENSOR_RECORD.size > TEXT_TENSOR_SPAN:
+            raise ValueError("tensor records exceed the reserved MOG span")
         file_size = cursor
 
         with tempfile.TemporaryDirectory(

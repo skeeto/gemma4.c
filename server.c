@@ -604,7 +604,7 @@ void handle_connection(Model *model, InferenceState *state, int socket_fd) {
 }
 
 int main(int argc, char **argv) {
-    const char *model_path = "gemma4-E2B-int8.bin";
+    const char *model_path = MODEL_FILE;
     int port = 8080;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];

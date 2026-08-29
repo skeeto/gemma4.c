@@ -1,6 +1,10 @@
 /gemma4-E2B-int8.bin
+/gemma4-E4B-int8.bin
+/gemma-4-E4B-it-qat-q4_0-unquantized/
 /run
 /run.exe
+/run-e4b
 /server
+/server-e4b
 /.venv
 /__pycache__/
