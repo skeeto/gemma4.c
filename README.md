@@ -69,18 +69,23 @@ make win64 WINCC=gcc
 ## HTTP server
 
 `server.c` wraps the runtime in a minimal OpenAI-style chat completions endpoint: just
-enough HTTP, SSE, and JSON for coding harnesses such as [OpenCode](https://opencode.ai)
-and [Pi](https://github.com/earendil-works/pi), with tool calling prompted through the
-chat template and translated to the standard `tools`/`tool_calls` wire format.
+enough HTTP, SSE, and JSON for coding harnesses such as [OpenCode](https://opencode.ai),
+[Pi](https://github.com/earendil-works/pi), and Prospero, with tool calling prompted
+through the chat template and translated to the standard `tools`/`tool_calls` wire
+format.
 
 ```bash
 make server
 ./server -m ./gemma4-E2B-int8.bin -p 8080
 ```
 
-The only endpoint is streaming `POST /v1/chat/completions`. Requests are served one at a
-time, and the KV cache carries over between requests that share a token prefix, so a
-growing agent conversation avoids re-prefilling its history each turn.
+It serves streaming `POST /v1/chat/completions`, and `GET /v1/models`, which lists the
+one model, `gemma4`, with its context size. Requests are served one at a time, and the KV
+cache carries over between requests that share a token prefix, so a growing agent
+conversation avoids re-prefilling its history each turn. During a long prefill, or while
+a tool call is withheld until complete, the stream sends SSE keep-alive comments every
+few seconds, so clients with idle timeouts keep waiting. A client that hangs up mid-prefill
+keeps what was prefilled, and its retry resumes from there.
 
 OpenCode (`~/.config/opencode/opencode.json`):
 
@@ -117,8 +122,23 @@ Pi (`~/.pi/agent/models.json`):
 }
 ```
 
-Then select `gemma4c/gemma4` in OpenCode's `/models`, or run
-`pi --provider gemma4c --model gemma4`. Expect small-model results: the protocol round
+Prospero (`~/.config/prospero/prospero.ini`) learns the model and its context size from
+the listing. Since the server takes one request at a time and holds one KV cache, limit
+the endpoint to one request in flight, and since the runtime is text only, keep
+screenshots and images out of requests:
+
+```ini
+[endpoint gemma4c]
+url = http://127.0.0.1:8080/
+max_concurrent = 1
+
+[model gemma4]
+vision = false
+```
+
+Then select `gemma4c/gemma4` in OpenCode's `/models`, run
+`pi --provider gemma4c --model gemma4`, or choose `gemma4c/gemma4` in Prospero (or
+`prospero run -m gemma4c/gemma4 PROMPT`). Expect small-model results: the protocol round
 trip works, but a 2B model is a weak coding agent.
 
 ## Model

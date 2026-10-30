@@ -82,21 +82,72 @@ int compare_lookup_keys(const void *key, const void *entry) {
     return memcmp(key, ((const LookupEntry *)entry)->key, 8);
 }
 
-// Repeatedly applies the highest-priority learned merge until no adjacent token pair matches.
-int apply_bpe_merges(const Tokenizer *tokenizer, int *tokens, int count) {
-    for (;;) {
-        const LookupEntry *best_merge = NULL;
-        int position = -1;
-        for (int i = 0; i + 1 < count; i++) {
-            const LookupEntry *merge = bsearch(tokens + i, tokenizer->merges, tokenizer->merge_count, sizeof(LookupEntry), compare_lookup_keys);
-            if (merge && (!best_merge || merge->rank < best_merge->rank)) { best_merge = merge; position = i; }
-        }
-        if (!best_merge) return count;
+// A candidate merge of the adjacent tokens at left and right, ordered by rank, then position.
+typedef struct {
+    int rank, left, right;
+    const LookupEntry *merge;
+} MergeCandidate;
 
-        tokens[position] = best_merge->result;
-        memmove(tokens + position + 1, tokens + position + 2, (count - position - 2) * sizeof(*tokens));
-        count--;
+int candidate_before(const MergeCandidate *a, const MergeCandidate *b) {
+    return a->rank != b->rank ? a->rank < b->rank : a->left < b->left;
+}
+
+// Pushes the merge for the pair at left and right onto the heap, if one exists.
+void push_candidate(const Tokenizer *tokenizer, const int *tokens, MergeCandidate *heap, int *heap_count, int left, int right) {
+    int pair[2] = {tokens[left], tokens[right]};
+    const LookupEntry *merge = bsearch(pair, tokenizer->merges, tokenizer->merge_count, sizeof(LookupEntry), compare_lookup_keys);
+    if (!merge) return;
+    int i = (*heap_count)++;
+    heap[i] = (MergeCandidate){merge->rank, left, right, merge};
+    for (; i && candidate_before(&heap[i], &heap[(i - 1) / 2]); i = (i - 1) / 2) {
+        MergeCandidate swap = heap[i]; heap[i] = heap[(i - 1) / 2]; heap[(i - 1) / 2] = swap;
     }
+}
+
+MergeCandidate pop_candidate(MergeCandidate *heap, int *heap_count) {
+    MergeCandidate top = heap[0];
+    heap[0] = heap[--*heap_count];
+    for (int i = 0;;) {
+        int least = i, child = 2 * i + 1;
+        if (child < *heap_count && candidate_before(&heap[child], &heap[least])) least = child;
+        if (child + 1 < *heap_count && candidate_before(&heap[child + 1], &heap[least])) least = child + 1;
+        if (least == i) break;
+        MergeCandidate swap = heap[i]; heap[i] = heap[least]; heap[least] = swap;
+        i = least;
+    }
+    return top;
+}
+
+// Repeatedly applies the highest-priority learned merge, leftmost first, until no adjacent
+// token pair matches. Tokens form a linked list, and a heap holds the candidate merges,
+// discarding those whose pair has since changed.
+int apply_bpe_merges(const Tokenizer *tokenizer, int *tokens, int count) {
+    if (count < 2) return count;
+    int *next = malloc((size_t)count * sizeof(int)), *prev = malloc((size_t)count * sizeof(int));
+    MergeCandidate *heap = malloc((size_t)count * 3 * sizeof(MergeCandidate)); // Each merge adds at most two.
+    if (!next || !prev || !heap) { perror("malloc"); exit(1); }
+    int heap_count = 0;
+    for (int i = 0; i < count; i++) { next[i] = i + 1; prev[i] = i - 1; }
+    for (int i = 0; i + 1 < count; i++) push_candidate(tokenizer, tokens, heap, &heap_count, i, i + 1);
+
+    while (heap_count) {
+        MergeCandidate c = pop_candidate(heap, &heap_count);
+        int pair[2] = {tokens[c.left], tokens[c.right]};
+        if (tokens[c.left] < 0 || next[c.left] != c.right || memcmp(pair, c.merge->key, 8)) continue; // Stale.
+        tokens[c.left] = c.merge->result;
+        tokens[c.right] = -1; // Absorbed into left.
+        next[c.left] = next[c.right];
+        if (next[c.left] < count) prev[next[c.left]] = c.left;
+        if (prev[c.left] >= 0) push_candidate(tokenizer, tokens, heap, &heap_count, prev[c.left], c.left);
+        if (next[c.left] < count) push_candidate(tokenizer, tokens, heap, &heap_count, c.left, next[c.left]);
+    }
+
+    int out = 0;
+    for (int i = 0; i < count; i = next[i]) tokens[out++] = tokens[i];
+    free(next);
+    free(prev);
+    free(heap);
+    return out;
 }
 
 // Converts the three prompt segments from UTF-8 into vocabulary pieces, falls back to byte tokens when needed, applies BPE, and prepends <bos>.

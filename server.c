@@ -1,11 +1,12 @@
 // A minimal OpenAI-style chat completions server for gemma4.c.
 //
 // Implements just enough HTTP, SSE, and JSON for coding harnesses that speak
-// the OpenAI chat completions protocol (tested against OpenCode and Pi): one
-// streaming POST /chat/completions endpoint, with tool calling prompted
-// through the chat template and mapped onto the standard tools/tool_calls
-// wire format. Requests are served one at a time, and the KV cache carries
-// over between requests that share a token prefix.
+// the OpenAI chat completions protocol (tested against OpenCode, Pi, and
+// Prospero): one streaming POST /chat/completions endpoint, with tool calling
+// prompted through the chat template and mapped onto the standard
+// tools/tool_calls wire format, and GET /models listing the one model.
+// Requests are served one at a time, and the KV cache carries over between
+// requests that share a token prefix.
 
 #define GEMMA4_LIB
 #include "gemma4.c"
@@ -20,6 +21,8 @@
 #define FENCE "```tool_call"
 #define MAX_BODY (64 << 20)
 #define DEFAULT_MAX_NEW 4096
+#define MODEL_ID "gemma4"
+#define KEEPALIVE_SECONDS 5.0
 
 // ----------------------------------------------------------------------------
 // Growable text buffer
@@ -245,7 +248,8 @@ void decode_content(const char *value, Buffer *out) {
 
 typedef struct {
     int socket;
-    int failed; // The client hung up, so stop generating for it.
+    int failed;         // The client hung up, so stop generating for it.
+    double last_write;  // When bytes last went out, for keep-alive pings.
 } Client;
 
 int call_counter;
@@ -258,7 +262,26 @@ int send_all(Client *client, const char *data, size_t len) {
         data += sent;
         len -= (size_t)sent;
     }
+    client->last_write = time_seconds();
     return client->failed ? -1 : 0;
+}
+
+// Sends an SSE comment after a stretch of silence (a long prefill, or a
+// withheld tool call) so that clients with idle timeouts keep waiting, and
+// so that a client that hung up is noticed.
+void keepalive(Client *client) {
+    static const char ping[] = ": keepalive\n\n";
+    if (time_seconds() - client->last_write >= KEEPALIVE_SECONDS)
+        send_all(client, ping, sizeof(ping) - 1);
+}
+
+void send_json(Client *client, const char *body) {
+    char head[256];
+    int head_len = snprintf(head, sizeof(head),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        strlen(body));
+    send_all(client, head, (size_t)head_len);
+    send_all(client, body, strlen(body));
 }
 
 void http_error(Client *client, int status, const char *reason, const char *message) {
@@ -275,7 +298,7 @@ void http_error(Client *client, int status, const char *reason, const char *mess
 void send_chunk(Client *client, const char *delta, const char *finish, const char *usage) {
     static Buffer frame;
     buffer_clear(&frame);
-    append_str(&frame, "data: {\"id\":\"gemma4\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gemma4\",\"choices\":[{\"index\":0,\"delta\":");
+    append_str(&frame, "data: {\"id\":\"gemma4\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" MODEL_ID "\",\"choices\":[{\"index\":0,\"delta\":");
     append_str(&frame, delta);
     append_str(&frame, ",\"finish_reason\":");
     if (finish) { append_str(&frame, "\""); append_str(&frame, finish); append_str(&frame, "\""); }
@@ -318,7 +341,8 @@ void send_finish(Client *client, const char *finish, int prompt, int cached, int
         "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,\"prompt_tokens_details\":{\"cached_tokens\":%d}}",
         prompt, completion, prompt + completion, cached);
     send_chunk(client, "{}", finish, usage);
-    send_all(client, "data: [DONE]\n\n", 15);
+    static const char done[] = "data: [DONE]\n\n";
+    send_all(client, done, sizeof(done) - 1);
 }
 
 // ----------------------------------------------------------------------------
@@ -512,14 +536,25 @@ void handle_completion(Model *model, InferenceState *state, Client *client, cons
     // when re-prefilling from common would read evicted positions.
     if (prev_count > SLIDING_WINDOW + BATCH_SIZE && common - (SLIDING_WINDOW - 1) < prev_count - (SLIDING_WINDOW + BATCH_SIZE))
         common = 0;
-    // Align the first chunk to the batch grid: sliding-cache writes are
-    // contiguous, so a chunk starting off the grid could cross the wrap boundary.
-    int fed = prompt_tokens - common;
-    int head = (BATCH_SIZE - common % BATCH_SIZE) % BATCH_SIZE;
-    if (head > fed) head = fed;
-    if (head) forward(model, state, token_ids + common, head, common);
-    prefill(model, state, token_ids + common + head, fed - head, common + head, 0);
-    int last_index = fed <= head ? fed - 1 : (fed - head - 1) % BATCH_SIZE;
+    // Prefill in chunks on the batch grid: sliding-cache writes are
+    // contiguous, so a chunk starting off the grid could cross the wrap
+    // boundary. Between chunks, ping the client, and stop if it hung up.
+    int done = common, last_index = 0;
+    while (done < prompt_tokens && !client->failed) {
+        int chunk = BATCH_SIZE - done % BATCH_SIZE;
+        if (chunk > prompt_tokens - done) chunk = prompt_tokens - done;
+        forward(model, state, token_ids + done, chunk, done);
+        done += chunk;
+        last_index = chunk - 1;
+        keepalive(client);
+    }
+    if (client->failed) {
+        // Keep what was prefilled, so a retry of this request resumes it.
+        prev_count = done;
+        memcpy(prev_ids, token_ids, (size_t)done * sizeof(int));
+        fprintf(stderr, "%d prompt tokens (%d cached), client left after %d\n", prompt_tokens, common, done);
+        return;
+    }
 
     if (debug_file) {
         fprintf(debug_file, "prompt ids (common=%d):", common);
@@ -540,6 +575,7 @@ void handle_completion(Model *model, InferenceState *state, Client *client, cons
         if (debug_file) fprintf(debug_file, " %d", next);
         stream_text(&stream, token_text(&model->tokenizer, next));
         if (stream.tool_done) { finish = "stop"; break; }
+        keepalive(client);
     }
     prev_count = position;
     memcpy(prev_ids, token_ids, (size_t)position * sizeof(int));
@@ -582,12 +618,28 @@ void handle_connection(Model *model, InferenceState *state, int socket_fd) {
     *split = 0; // Terminate the headers for parsing.
     char *line_end = strchr(request.data, '\r');
     if (line_end) *line_end = 0;
-    int matched = !strncmp(request.data, "POST ", 5) && strstr(request.data, "/chat/completions ");
+    // The path, with any /v1 prefix and query string dropped.
+    char *path = strchr(request.data, ' ');
+    path = path ? path + 1 : request.data + strlen(request.data);
+    if (!strncmp(path, "/v1/", 4)) path += 3;
+    path[strcspn(path, " ?")] = 0;
     long content_length = -1;
     for (const char *h = line_end ? line_end + 1 : split; (h = strchr(h, '\n')); )
         if (!strncasecmp(++h, "Content-Length:", 15)) { content_length = strtol(h + 15, NULL, 10); break; }
 
-    if (!matched) { http_error(&client, 404, "Not Found", "only POST /chat/completions is served"); return; }
+    if (!strncmp(request.data, "GET ", 4) && (!strcmp(path, "/models") || !strcmp(path, "/models/" MODEL_ID))) {
+        // n_ctx is how llama.cpp reports the context size, as Prospero reads it.
+        char model[256];
+        snprintf(model, sizeof(model),
+            "{\"id\":\"" MODEL_ID "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"gemma4.c\","
+            "\"meta\":{\"n_ctx\":%d}}", MAX_CONTEXT);
+        char listing[300];
+        snprintf(listing, sizeof(listing), "{\"object\":\"list\",\"data\":[%s]}", model);
+        send_json(&client, path[7] ? model : listing);
+        return;
+    }
+    int matched = !strncmp(request.data, "POST ", 5) && !strcmp(path, "/chat/completions");
+    if (!matched) { http_error(&client, 404, "Not Found", "only POST /v1/chat/completions and GET /v1/models are served"); return; }
     if (content_length < 2 || content_length > MAX_BODY) { http_error(&client, 400, "Bad Request", "missing or oversized body"); return; }
     while (request.len < body_offset + (size_t)content_length) {
         char data[65536];
