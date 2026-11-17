@@ -162,6 +162,32 @@ python3 exporter.py /path/to/gemma-4-E2B-it-qat-q4_0-unquantized -o ./gemma4-E2B
 
 Python is only needed to export the model or run numerical validation. Once the `.bin` file exists, inference runs entirely through the C program.
 
+## GGUF model
+
+E2B builds also load Google's quantization-aware q4_0 GGUF, a 3.35 GB
+download, given its path with `-m`:
+
+```bash
+hf download google/gemma-4-E2B-it-qat-q4_0-gguf gemma-4-E2B_q4_0-it.gguf \
+  --revision 675cff42a74c774d6cb76f76d8eacb49b48c9b93 --local-dir .
+./run -m gemma-4-E2B_q4_0-it.gguf -t 0 "Why is the sky blue?"
+```
+
+Only that file is supported, not GGUF in general. Its transformer matrices
+are q4_0 and are multiplied in place; its q6_K per-layer embedding table is
+read a row at a time; the q6_K token table, which is also the output
+projection, and the f16 per-layer projection are converted to int8 at load.
+The tokenizer built from its metadata is identical to the exported one.
+
+Its q4_0 values are not exactly the trained ones. The QAT checkpoints'
+weights (checked on E4B's) lie exactly on a 4-bit grid, but with each
+block's own step, which
+the GGUF's quantization (the block's largest value over -8) does not
+recover, for a 5% relative error in every matrix. Over the first 1,003
+positions of the validation article, it agrees with the int8 model on the
+top token 88.4% of the time (mean KL 0.049); with the int8 model's
+transformer matrices swapped in, 97.8%.
+
 ## Numerical validation
 
 The implementation is validated against the Hugging Face Transformers reference implementation running Google's unquantized [Gemma 4 E2B QAT checkpoint](https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-unquantized) in BF16. Both implementations process the complete Éva Gauthier article from the WikiText-103 validation split under teacher forcing. The passage contains 2,387 text tokens, and the added BOS token brings the comparison to 2,388 model positions.

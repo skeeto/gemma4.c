@@ -8,3 +8,4 @@
 /server-e4b
 /.venv
 /__pycache__/
+/*.gguf

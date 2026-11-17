@@ -194,10 +194,15 @@ const char *token_text(const Tokenizer *tokenizer, int token) {
 // Model
 
 // data and scales begin as file offsets and become pointers after the model is memory-mapped.
+// How a tensor's data is stored. The exporter's files hold only TENSOR_PACKED
+// and plain float data, and leave the type slot zero.
+enum { TENSOR_PACKED, TENSOR_Q4_0, TENSOR_Q6_K };
+
 typedef struct {
     void *data;
     uint16_t *scales;
-    int shape[4];
+    int shape[3];
+    int type;
 } Tensor;
 
 typedef struct {
@@ -391,8 +396,12 @@ static inline __attribute__((always_inline)) void matmul_block(
 }
 #endif
 
+void matmul_q4_0(float *output, const int8_t *input_q, const float *input_scales,
+                 const Tensor *weight, size_t rows);
+
 void matmul_int8(float *output, const int8_t *input_q, const float *input_scales,
                  const Tensor *weight, size_t rows) {
+    if (weight->type == TENSOR_Q4_0) { matmul_q4_0(output, input_q, input_scales, weight, rows); return; }
     const size_t block_rows = 16;
     #pragma omp for schedule(static)
     for (size_t output_block = 0; output_block < (size_t)weight->shape[0] / block_rows; output_block++)
@@ -504,9 +513,18 @@ void geglu(float *gate, const float *up, int rows, int width, int up_stride, con
 // Transformer
 
 // Looks up packed int8 embedding rows and dequantizes them directly without materializing the full embedding table.
+void dequantize_q6_K(float *output, const void *blocks, int width, float multiplier);
+
 void embedding(float *output, const Tensor *table, const int *tokens, size_t token_count, float multiplier) {
     const int block_rows = 16;
     int width = table->shape[1];
+    if (table->type == TENSOR_Q6_K) {
+        size_t row_bytes = (size_t)width / 256 * 210;
+        #pragma omp for schedule(static)
+        for (size_t token = 0; token < token_count; token++)
+            dequantize_q6_K(output + token * width, (const uint8_t *)table->data + (size_t)tokens[token] * row_bytes, width, multiplier);
+        return;
+    }
     int groups = width / 64;
     #pragma omp for schedule(static)
     for (size_t token = 0; token < token_count; token++) {
@@ -810,6 +828,574 @@ void benchmark(Model *model, InferenceState *state, int prefill_tokens, int gene
     }
 }
 
+// ----------------------------------------------------------------------------
+// GGUF models
+//
+// Loads Google's quantization-aware checkpoint in llama.cpp's format,
+// gemma-4-E2B_q4_0-it.gguf, rather than GGUF in general. Its transformer
+// matrices are q4_0, multiplied in place. Its two embedding tables are q6_K:
+// the per-layer table is read in place a row at a time, while the token
+// table, which is also the output projection, is converted at load to the
+// packed int8 layout, as is the f16 per-layer model projection. The
+// tokenizer's lookup tables and the RoPE and GELU tables, which an exported
+// file carries, are built at load.
+
+typedef struct {
+    uint16_t scale;
+    uint8_t values[16]; // Low nibbles hold inputs 0-15, high nibbles 16-31, offset by 8.
+} BlockQ4_0;
+
+_Static_assert(sizeof(BlockQ4_0) == 18, "q4_0 block layout");
+
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q6_K = 14 };
+
+static inline uint16_t float_to_half(float value) {
+#if defined(__ARM_NEON)
+    __fp16 half = (__fp16)value;
+    uint16_t bits;
+    memcpy(&bits, &half, sizeof(bits));
+    return bits;
+#else
+    return _cvtss_sh(value, 0);
+#endif
+}
+
+// Expands one row of q6_K super-blocks: 256 values each, as 4 low and 2 high
+// bits, with a signed 8-bit scale per 16 values and an f16 scale overall.
+void dequantize_q6_K(float *output, const void *blocks, int width, float multiplier) {
+    const uint8_t *block = blocks;
+    for (int b = 0; b < width / 256; b++, block += 210) {
+        const uint8_t *low = block, *high = block + 128;
+        const int8_t *scales = (const int8_t *)(block + 192);
+        uint16_t bits;
+        memcpy(&bits, block + 208, sizeof(bits));
+        float scale = half_to_float(bits) * multiplier;
+        float *y = output + b * 256;
+        for (int half = 0; half < 2; half++, y += 128, low += 64, high += 32, scales += 8) {
+            for (int l = 0; l < 32; l++) {
+                int s = l / 16;
+                y[l + 0]  = scale * scales[s + 0] * (((low[l] & 0xF)      | ((high[l] >> 0 & 3) << 4)) - 32);
+                y[l + 32] = scale * scales[s + 2] * (((low[l + 32] & 0xF) | ((high[l] >> 2 & 3) << 4)) - 32);
+                y[l + 64] = scale * scales[s + 4] * (((low[l] >> 4)       | ((high[l] >> 4 & 3) << 4)) - 32);
+                y[l + 96] = scale * scales[s + 6] * (((low[l + 32] >> 4)  | ((high[l] >> 6 & 3) << 4)) - 32);
+            }
+        }
+    }
+}
+
+// Multiplies int8 activations, quantized in groups of 64, by q4_0 weights in
+// blocks of 32: each block's integer dot product is scaled by the weight
+// block's scale and its activation group's. A tile of four output rows is
+// unpacked once per block and reused across a few input rows.
+#if defined(__ARM_NEON)
+#define Q4_TILE_INPUTS 4
+static inline __attribute__((always_inline)) void matmul_q4_0_tile(
+    float *output, const int8_t *input_q, const float *input_scales,
+    const Tensor *weight, size_t rows, size_t first_output) {
+    size_t width = (size_t)weight->shape[1], blocks = width / 32, groups = width / 64;
+    const BlockQ4_0 *weights = (const BlockQ4_0 *)weight->data + first_output * blocks;
+    for (size_t row_start = 0; row_start < rows; row_start += Q4_TILE_INPUTS) {
+        size_t active_rows = rows - row_start < Q4_TILE_INPUTS ? rows - row_start : Q4_TILE_INPUTS;
+        float32x4_t sum[Q4_TILE_INPUTS][4] = {0};
+        for (size_t b = 0; b < blocks; b++) {
+            int8x16_t low[4], high[4];
+            float weight_scale[4];
+            for (int o = 0; o < 4; o++) {
+                const BlockQ4_0 *block = &weights[o * blocks + b];
+                uint8x16_t packed = vld1q_u8(block->values);
+                low[o] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0xF))), vdupq_n_s8(8));
+                high[o] = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), vdupq_n_s8(8));
+                weight_scale[o] = half_to_float(block->scale);
+            }
+            for (size_t row = 0; row < active_rows; row++) {
+                const int8_t *input = input_q + (row_start + row) * width + b * 32;
+                int8x16_t first = vld1q_s8(input), second = vld1q_s8(input + 16);
+                float input_scale = input_scales[(row_start + row) * groups + b / 2];
+                for (int o = 0; o < 4; o++) {
+                    int32x4_t dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), low[o], first), high[o], second);
+                    sum[row][o] = vfmaq_n_f32(sum[row][o], vcvtq_f32_s32(dot), weight_scale[o] * input_scale);
+                }
+            }
+        }
+        for (size_t row = 0; row < active_rows; row++)
+            for (int o = 0; o < 4; o++)
+                output[(row_start + row) * weight->shape[0] + first_output + o] = vaddvq_f32(sum[row][o]);
+    }
+}
+#else
+#define Q4_TILE_INPUTS 2
+static inline __attribute__((always_inline)) void matmul_q4_0_tile(
+    float *output, const int8_t *input_q, const float *input_scales,
+    const Tensor *weight, size_t rows, size_t first_output) {
+    size_t width = (size_t)weight->shape[1], blocks = width / 32, groups = width / 64;
+    const BlockQ4_0 *weights = (const BlockQ4_0 *)weight->data + first_output * blocks;
+    for (size_t row_start = 0; row_start < rows; row_start += Q4_TILE_INPUTS) {
+        size_t active_rows = rows - row_start < Q4_TILE_INPUTS ? rows - row_start : Q4_TILE_INPUTS;
+        __m256 sum[Q4_TILE_INPUTS][4] = {0};
+        for (size_t b = 0; b < blocks; b++) {
+            __m256i values[4], magnitudes[4];
+            float weight_scale[4];
+            for (int o = 0; o < 4; o++) {
+                const BlockQ4_0 *block = &weights[o * blocks + b];
+                __m128i packed = _mm_loadu_si128((const __m128i *)block->values);
+                __m128i low = _mm_and_si128(packed, _mm_set1_epi8(0xF));
+                __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(0xF));
+                values[o] = _mm256_sub_epi8(_mm256_set_m128i(high, low), _mm256_set1_epi8(8));
+                magnitudes[o] = _mm256_abs_epi8(values[o]);
+                weight_scale[o] = half_to_float(block->scale);
+            }
+            for (size_t row = 0; row < active_rows; row++) {
+                __m256i input = _mm256_loadu_si256((const __m256i *)(input_q + (row_start + row) * width + b * 32));
+                float input_scale = input_scales[(row_start + row) * groups + b / 2];
+                for (int o = 0; o < 4; o++) {
+                    __m256i dot = _mm256_madd_epi16(_mm256_maddubs_epi16(magnitudes[o], _mm256_sign_epi8(input, values[o])), _mm256_set1_epi16(1));
+                    sum[row][o] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(weight_scale[o] * input_scale), sum[row][o]);
+                }
+            }
+        }
+        for (size_t row = 0; row < active_rows; row++)
+            for (int o = 0; o < 4; o++) {
+                __m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(sum[row][o]), _mm256_extractf128_ps(sum[row][o], 1));
+                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+                output[(row_start + row) * weight->shape[0] + first_output + o] = _mm_cvtss_f32(_mm_add_ss(sum4, _mm_movehdup_ps(sum4)));
+            }
+    }
+}
+#endif
+
+void matmul_q4_0(float *output, const int8_t *input_q, const float *input_scales,
+                 const Tensor *weight, size_t rows) {
+    #pragma omp for schedule(static)
+    for (size_t tile = 0; tile < (size_t)weight->shape[0] / 4; tile++)
+        matmul_q4_0_tile(output, input_q, input_scales, weight, rows, tile * 4);
+}
+
+// A cursor over the file, which flags rather than overruns a truncated one.
+typedef struct {
+    const uint8_t *at, *end;
+    int bad;
+} Reader;
+
+static uint64_t read_uint(Reader *r, int size) {
+    uint64_t value = 0;
+    if (r->end - r->at < size) { r->bad = 1; return 0; }
+    memcpy(&value, r->at, (size_t)size); // GGUF is little-endian, as are the CPUs this runs on.
+    r->at += size;
+    return value;
+}
+
+typedef struct {
+    const char *text;
+    size_t len;
+} Text;
+
+static Text read_text(Reader *r) {
+    uint64_t len = read_uint(r, 8);
+    if ((uint64_t)(r->end - r->at) < len) { r->bad = 1; return (Text){"", 0}; }
+    Text text = {(const char *)r->at, (size_t)len};
+    r->at += len;
+    return text;
+}
+
+static int text_is(Text text, const char *s) { return text.len == strlen(s) && !memcmp(text.text, s, text.len); }
+
+// Skips a metadata value of the given type.
+static void skip_value(Reader *r, uint32_t type) {
+    static const int sizes[13] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    if (type == 8) read_text(r);
+    else if (type == 9) {
+        uint32_t element = (uint32_t)read_uint(r, 4);
+        uint64_t count = read_uint(r, 8);
+        if (element < 13 && element != 8 && element != 9) {
+            if ((uint64_t)(r->end - r->at) / sizes[element] < count) r->bad = 1;
+            else r->at += count * sizes[element];
+        } else for (uint64_t i = 0; i < count && !r->bad; i++) skip_value(r, element);
+    } else if (type < 13) read_uint(r, sizes[type]);
+    else r->bad = 1;
+}
+
+// A metadata array: its element type, length, and where its elements begin.
+typedef struct {
+    uint32_t type;
+    uint64_t count;
+    const uint8_t *at, *end;
+} Array;
+
+typedef struct {
+    Text name;
+    int dims[4], dim_count;
+    uint32_t type;
+    const uint8_t *data;
+} GgufTensor;
+
+typedef struct {
+    GgufTensor *tensors;
+    int count;
+    const char *path;
+    int missing;
+} TensorIndex;
+
+static const GgufTensor *find_tensor(TensorIndex *index, const char *name) {
+    for (int i = 0; i < index->count; i++)
+        if (text_is(index->tensors[i].name, name)) return &index->tensors[i];
+    return NULL;
+}
+
+// Points t at a tensor of the given type and shape (outputs, inputs; inputs
+// only for a vector), or leaves it empty when optional and absent.
+static void bind_tensor(TensorIndex *index, Tensor *t, const char *name, uint32_t type, int optional) {
+    const GgufTensor *g = find_tensor(index, name);
+    if (!g) {
+        if (!optional) { fprintf(stderr, "%s: missing tensor %s\n", index->path, name); index->missing = 1; }
+        return;
+    }
+    if (g->type != type) { fprintf(stderr, "%s: tensor %s has type %u, expected %u\n", index->path, name, g->type, type); index->missing = 1; return; }
+    t->data = (void *)g->data;
+    t->shape[0] = g->dim_count > 1 ? g->dims[1] : g->dims[0]; // GGUF lists the innermost dimension first.
+    t->shape[1] = g->dim_count > 1 ? g->dims[0] : 0;
+    t->type = type == GGML_Q4_0 ? TENSOR_Q4_0 : type == GGML_Q6_K ? TENSOR_Q6_K : TENSOR_PACKED;
+}
+
+// Converts a matrix, one source row at a time, to the exporter's packed int8
+// layout: groups of 64 inputs with an f16 scale each, interleaved in blocks
+// of 16 rows by 4 inputs.
+static void pack_int8(Tensor *t, const void *source, int source_type) {
+    size_t rows = (size_t)t->shape[0], width = (size_t)t->shape[1], groups = width / 64;
+    int8_t *values = malloc(rows * width);
+    uint16_t *scales = malloc(rows * groups * sizeof(*scales));
+    if (!values || !scales) { perror("malloc"); exit(1); }
+    #pragma omp parallel num_threads(thread_count())
+    {
+    float *row_values = malloc(width * sizeof(float));
+    #pragma omp for schedule(static)
+    for (size_t row = 0; row < rows; row++) {
+        if (source_type == GGML_Q6_K) dequantize_q6_K(row_values, (const uint8_t *)source + row * (width / 256 * 210), (int)width, 1.0f);
+        else for (size_t i = 0; i < width; i++) row_values[i] = half_to_float(((const uint16_t *)source)[row * width + i]);
+        size_t block = row / 16, in_block = row % 16;
+        for (size_t g = 0; g < groups; g++) {
+            float max_abs = 0.0f;
+            for (int j = 0; j < 64; j++) if (fabsf(row_values[g * 64 + j]) > max_abs) max_abs = fabsf(row_values[g * 64 + j]);
+            uint16_t bits = float_to_half(fmaxf(max_abs / 127.0f, 6.104e-05f)); // Quantize against the scale as stored.
+            float scale = half_to_float(bits);
+            scales[(block * groups + g) * 16 + in_block] = bits;
+            for (int j = 0; j < 64; j++) {
+                float q = rintf(row_values[g * 64 + j] / scale);
+                q = q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q;
+                values[block * 16 * width + g * 1024 + (size_t)(j / 4) * 64 + in_block * 4 + j % 4] = (int8_t)q;
+            }
+        }
+    }
+    free(row_values);
+    }
+    t->data = values;
+    t->scales = scales;
+    t->type = TENSOR_PACKED;
+}
+
+// Builds a cosine and sine table for every position: pairs rotated channel
+// pairs of a head_dim-wide head, as the exporter computes them.
+static void rope_table(Tensor *cosines, Tensor *sines, int head_dim, int pairs, float theta) {
+    float *cosine = malloc((size_t)MAX_CONTEXT * pairs * sizeof(float));
+    float *sine = malloc((size_t)MAX_CONTEXT * pairs * sizeof(float));
+    if (!cosine || !sine) { perror("malloc"); exit(1); }
+    #pragma omp parallel for num_threads(thread_count()) schedule(static)
+    for (int position = 0; position < MAX_CONTEXT; position++)
+        for (int j = 0; j < pairs; j++) {
+            float frequency = 1.0f / powf(theta, (float)(2 * j) / (float)head_dim);
+            float angle = (float)position * frequency;
+            cosine[(size_t)position * pairs + j] = cosf(angle);
+            sine[(size_t)position * pairs + j] = sinf(angle);
+        }
+    *cosines = (Tensor){.data = cosine, .shape = {MAX_CONTEXT, pairs}};
+    *sines = (Tensor){.data = sine, .shape = {MAX_CONTEXT, pairs}};
+}
+
+// A string-to-id table over the vocabulary, by open addressing.
+#define VOCAB_SLOTS (1 << 19)
+
+static uint32_t text_hash(const char *text, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) hash = (hash ^ (uint8_t)text[i]) * 16777619u;
+    return hash;
+}
+
+static int vocab_find(const int *slots, const Text *tokens, const char *text, size_t len) {
+    for (uint32_t i = text_hash(text, len) & (VOCAB_SLOTS - 1);; i = (i + 1) & (VOCAB_SLOTS - 1)) {
+        int id = slots[i];
+        if (id < 0) return -1;
+        if (tokens[id].len == len && !memcmp(tokens[id].text, text, len)) return id;
+    }
+}
+
+static int compare_entries(const void *a, const void *b) { return memcmp(a, b, 8); }
+
+static int special_longer(const void *a, const void *b) {
+    const VocabEntry *x = a, *y = b;
+    size_t lx = strlen(x->token), ly = strlen(y->token);
+    return lx != ly ? (lx < ly) - (lx > ly) : strcmp(x->token, y->token);
+}
+
+// Builds the tokenizer's tables from the vocabulary as the exporter does:
+// special tokens (control tokens, and the few llama.cpp marks user-defined
+// so that they print), single pieces of up to 4 bytes that no merge makes,
+// and the merges by token-id pair. Returns 0 on success.
+static int build_tokenizer(Tokenizer *tokenizer, Array tokens_array, Array types_array, Array merges_array) {
+    if (tokens_array.type != 8 || tokens_array.count != VOCAB_SIZE || types_array.type != 5 ||
+        types_array.count != VOCAB_SIZE || merges_array.type != 8 || merges_array.count > 514906) return 1;
+    Text *tokens = malloc(VOCAB_SIZE * sizeof(*tokens));
+    int *slots = malloc(VOCAB_SLOTS * sizeof(*slots));
+    uint8_t *made = calloc(VOCAB_SIZE, 1); // Whether a merge produces the token.
+    if (!tokens || !slots || !made) { perror("malloc"); exit(1); }
+    memset(slots, -1, VOCAB_SLOTS * sizeof(*slots));
+    Reader r = {tokens_array.at, tokens_array.end, 0};
+    for (int id = 0; id < VOCAB_SIZE; id++) {
+        tokens[id] = read_text(&r);
+        uint32_t i = text_hash(tokens[id].text, tokens[id].len) & (VOCAB_SLOTS - 1);
+        while (slots[i] >= 0) i = (i + 1) & (VOCAB_SLOTS - 1);
+        slots[i] = id;
+    }
+
+    int bad = 0;
+    tokenizer->merge_count = 0;
+    r = (Reader){merges_array.at, merges_array.end, 0};
+    for (uint64_t rank = 0; rank < merges_array.count && !bad; rank++) {
+        Text merge = read_text(&r);
+        int left = -1, right = -1, result = -1;
+        // Split at whichever space leaves a token on both sides.
+        for (size_t at = 0; at < merge.len && result < 0; at++) {
+            if (merge.text[at] != ' ') continue;
+            left = vocab_find(slots, tokens, merge.text, at);
+            right = vocab_find(slots, tokens, merge.text + at + 1, merge.len - at - 1);
+            if (left < 0 || right < 0) continue;
+            char joined[192];
+            if (merge.len - 1 > sizeof(joined)) break;
+            memcpy(joined, merge.text, at);
+            memcpy(joined + at, merge.text + at + 1, merge.len - at - 1);
+            result = vocab_find(slots, tokens, joined, merge.len - 1);
+        }
+        if (result < 0) { bad = 1; break; }
+        LookupEntry *entry = &tokenizer->merges[tokenizer->merge_count++];
+        memcpy(entry->key, &left, 4);
+        memcpy(entry->key + 4, &right, 4);
+        entry->result = result;
+        entry->rank = (int)rank;
+        made[result] = 1;
+    }
+    qsort(tokenizer->merges, (size_t)tokenizer->merge_count, sizeof(LookupEntry), compare_entries);
+
+    static const char *visible[] = {"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>",
+                                    "<|tool_response>", "<tool_response|>", "<|\"|>"};
+    tokenizer->special_count = tokenizer->encode_vocab_count = 0;
+    for (int id = 0; id < VOCAB_SIZE && !bad; id++) {
+        int32_t type;
+        memcpy(&type, types_array.at + (size_t)id * 4, 4);
+        Text token = tokens[id];
+        int special = type == 3;
+        for (int i = 0; i < 7; i++) special |= type == 4 && text_is(token, visible[i]);
+        char *decoded = tokenizer->decoded_tokens[id];
+        if (token.len >= 94) { bad = 1; break; }
+        if (special) {
+            if (tokenizer->special_count == 256) { bad = 1; break; }
+            VocabEntry *entry = &tokenizer->specials[tokenizer->special_count++];
+            memcpy(entry->token, token.text, token.len);
+            entry->id = id;
+            decoded[0] = 0;
+            continue;
+        }
+        if (type == 6) { // A byte token, <0xNN>.
+            decoded[0] = (char)strtol(token.text + 3, NULL, 16);
+            decoded[1] = 0;
+        } else {
+            size_t n = 0;
+            for (size_t i = 0; i < token.len; i++) {
+                if (i + 2 < token.len && !memcmp(token.text + i, "\xE2\x96\x81", 3)) { decoded[n++] = ' '; i += 2; }
+                else decoded[n++] = token.text[i];
+            }
+            decoded[n] = 0;
+        }
+        if (!made[id] && token.len <= 4) {
+            if (tokenizer->encode_vocab_count == 32768) { bad = 1; break; }
+            LookupEntry *entry = &tokenizer->encode_vocab[tokenizer->encode_vocab_count++];
+            memset(entry->key, 0, 8);
+            memcpy(entry->key, token.text, token.len);
+            entry->result = id;
+            entry->rank = 0;
+        }
+    }
+    qsort(tokenizer->encode_vocab, (size_t)tokenizer->encode_vocab_count, sizeof(LookupEntry), compare_entries);
+    qsort(tokenizer->specials, (size_t)tokenizer->special_count, sizeof(VocabEntry), special_longer);
+    free(tokens);
+    free(slots);
+    free(made);
+    return bad;
+}
+
+Model *load_gguf(const uint8_t *file, size_t size, const char *path) {
+    Reader r = {file + 4, file + size, 0};
+    uint32_t version = (uint32_t)read_uint(&r, 4);
+    uint64_t tensor_count = read_uint(&r, 8), metadata_count = read_uint(&r, 8);
+    if (version != 3 || tensor_count > 4096) { fprintf(stderr, "%s: unsupported GGUF file\n", path); return NULL; }
+
+    // Keep the metadata this model needs, checking it against the constants compiled in.
+    Array tokens = {0}, types = {0}, merges = {0}, pattern = {0};
+    uint64_t alignment = 32;
+    int layers = 0, width = 0, window = 0, context = 0, per_layer = 0, shared = 0;
+    float theta = 0.0f, theta_sliding = 0.0f;
+    for (uint64_t i = 0; i < metadata_count && !r.bad; i++) {
+        Text key = read_text(&r);
+        uint32_t type = (uint32_t)read_uint(&r, 4);
+        const uint8_t *value = r.at;
+        if (type == 9) {
+            Array a = {(uint32_t)read_uint(&r, 4), read_uint(&r, 8), r.at, r.end};
+            if (text_is(key, "tokenizer.ggml.tokens")) tokens = a;
+            else if (text_is(key, "tokenizer.ggml.token_type")) types = a;
+            else if (text_is(key, "tokenizer.ggml.merges")) merges = a;
+            else if (text_is(key, "gemma4.attention.sliding_window_pattern")) pattern = a;
+            r.at = value;
+            skip_value(&r, type);
+            continue;
+        }
+        skip_value(&r, type);
+        if (r.bad) break;
+        uint32_t u32 = 0;
+        float f32 = 0.0f;
+        if (type == 4 || type == 5) memcpy(&u32, value, 4);
+        if (type == 6) memcpy(&f32, value, 4);
+        if (text_is(key, "general.architecture") && !(type == 8 && text_is((Text){(const char *)value + 8, (size_t)(r.at - value - 8)}, "gemma4"))) {
+            fprintf(stderr, "%s: not a Gemma 4 model\n", path);
+            return NULL;
+        }
+        if (text_is(key, "general.alignment")) alignment = u32;
+        else if (text_is(key, "gemma4.block_count")) layers = (int)u32;
+        else if (text_is(key, "gemma4.embedding_length")) width = (int)u32;
+        else if (text_is(key, "gemma4.attention.sliding_window")) window = (int)u32;
+        else if (text_is(key, "gemma4.context_length")) context = (int)u32;
+        else if (text_is(key, "gemma4.embedding_length_per_layer_input")) per_layer = (int)u32;
+        else if (text_is(key, "gemma4.attention.shared_kv_layers")) shared = (int)u32;
+        else if (text_is(key, "gemma4.rope.freq_base")) theta = f32;
+        else if (text_is(key, "gemma4.rope.freq_base_swa")) theta_sliding = f32;
+    }
+    int pattern_ok = pattern.type == 7 && pattern.count == NUM_LAYERS;
+    for (int i = 0; pattern_ok && i < NUM_LAYERS; i++)
+        pattern_ok = pattern.at[i] == (i % FULL_INTERVAL != FULL_INTERVAL - 1); // True marks a sliding layer.
+    if (r.bad || layers != NUM_LAYERS || width != HIDDEN_SIZE || window != SLIDING_WINDOW || context != MAX_CONTEXT ||
+        per_layer != 256 || shared != NUM_LAYERS - CACHE_SETS * FULL_INTERVAL || !pattern_ok || !theta || !theta_sliding ||
+        !alignment || alignment & (alignment - 1)) {
+        fprintf(stderr, "%s: not the Gemma 4 variant this build supports\n", path);
+        return NULL;
+    }
+
+    GgufTensor *list = calloc(tensor_count, sizeof(*list));
+    if (!list) { perror("calloc"); return NULL; }
+    for (uint64_t i = 0; i < tensor_count && !r.bad; i++) {
+        list[i].name = read_text(&r);
+        list[i].dim_count = (int)read_uint(&r, 4);
+        if (list[i].dim_count < 1 || list[i].dim_count > 4) { r.bad = 1; break; }
+        for (int d = 0; d < list[i].dim_count; d++) {
+            uint64_t dim = read_uint(&r, 8);
+            if (dim < 1 || dim > (1u << 30)) r.bad = 1;
+            list[i].dims[d] = (int)dim;
+        }
+        list[i].type = (uint32_t)read_uint(&r, 4);
+        list[i].data = (const uint8_t *)(uintptr_t)read_uint(&r, 8); // An offset into the data, for now.
+    }
+    size_t data_start = ((size_t)(r.at - file) + alignment - 1) & ~(size_t)(alignment - 1);
+    for (uint64_t i = 0; i < tensor_count && !r.bad; i++) {
+        GgufTensor *t = &list[i];
+        uint64_t count = 1;
+        for (int d = 0; d < t->dim_count; d++) count *= (uint64_t)t->dims[d];
+        uint64_t bytes = t->type == GGML_F32 ? count * 4 : t->type == GGML_F16 ? count * 2 :
+                         t->type == GGML_Q4_0 ? count / 32 * 18 : t->type == GGML_Q6_K ? count / 256 * 210 : 0;
+        uint64_t offset = (uint64_t)(uintptr_t)t->data;
+        if (offset > size || data_start > size - offset || bytes > size - data_start - offset) r.bad = 1;
+        t->data = file + data_start + offset;
+    }
+    if (r.bad) { fprintf(stderr, "%s: truncated or malformed GGUF file\n", path); free(list); return NULL; }
+
+    Model *model = calloc(1, sizeof(*model));
+    if (!model) { perror("calloc"); free(list); return NULL; }
+    memcpy(model->magic, "GGUF", 4);
+    if (build_tokenizer(&model->tokenizer, tokens, types, merges)) {
+        fprintf(stderr, "%s: unexpected tokenizer\n", path);
+        free(list);
+        free(model);
+        return NULL;
+    }
+
+    TensorIndex index = {list, (int)tensor_count, path, 0};
+    ModelWeights *w = &model->weights;
+    bind_tensor(&index, &w->embed, "token_embd.weight", GGML_Q6_K, 0);
+    bind_tensor(&index, &w->embed_per_layer, "per_layer_token_embd.weight", GGML_Q6_K, 0);
+    bind_tensor(&index, &w->norm, "output_norm.weight", GGML_F32, 0);
+    bind_tensor(&index, &w->per_layer_model_projection, "per_layer_model_proj.weight", GGML_F16, 0);
+    bind_tensor(&index, &w->per_layer_projection_norm, "per_layer_proj_norm.weight", GGML_F32, 0);
+    Tensor rope_frequencies = {0};
+    bind_tensor(&index, &rope_frequencies, "rope_freqs.weight", GGML_F32, 0);
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        LayerWeights *l = &w->layers[layer];
+        int writes_kv = layer < NUM_LAYERS - shared;
+        struct { Tensor *t; const char *name; uint32_t type; int optional; } names[] = {
+            {&l->input_layernorm, "attn_norm", GGML_F32, 0},
+            {&l->layer_scalar, "layer_output_scale", GGML_F32, 0},
+            {&l->pre_ffn_layernorm, "ffn_norm", GGML_F32, 0},
+            {&l->post_attn_layernorm, "post_attention_norm", GGML_F32, 0},
+            {&l->post_ffn_layernorm, "post_ffw_norm", GGML_F32, 0},
+            {&l->post_per_layer_input_norm, "post_norm", GGML_F32, 0},
+            {&l->per_layer_input_gate, "inp_gate", GGML_Q4_0, 0},
+            {&l->per_layer_projection, "proj", GGML_Q4_0, 0},
+            {&l->q_norm, "attn_q_norm", GGML_F32, 0},
+            {&l->k_norm, "attn_k_norm", GGML_F32, !writes_kv},
+            {&l->q_proj, "attn_q", GGML_Q4_0, 0},
+            {&l->k_proj, "attn_k", GGML_Q4_0, !writes_kv},
+            {&l->v_proj, "attn_v", GGML_Q4_0, !writes_kv},
+            {&l->o_proj, "attn_output", GGML_Q4_0, 0},
+            {&l->gate_proj, "ffn_gate", GGML_Q4_0, 0},
+            {&l->up_proj, "ffn_up", GGML_Q4_0, 0},
+            {&l->down_proj, "ffn_down", GGML_Q4_0, 0},
+        };
+        for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, names[i].name);
+            bind_tensor(&index, names[i].t, name, names[i].type, names[i].optional);
+        }
+        if (!writes_kv && l->k_proj.data) { fprintf(stderr, "%s: layer %d has its own KV\n", path, layer); index.missing = 1; }
+    }
+    free(list);
+    if (index.missing || w->embed.shape[0] != VOCAB_SIZE || w->embed.shape[1] != HIDDEN_SIZE) {
+        fprintf(stderr, "%s: not the Gemma 4 variant this build supports\n", path);
+        free(model);
+        return NULL;
+    }
+
+    // Proportional RoPE: the full-attention layers rotate only the channel
+    // pairs whose frequency factor is 1 (the rest are 1e30, unrotated), at
+    // frequencies set by the full head width.
+    const float *factors = rope_frequencies.data;
+    int full_pairs = 0;
+    while (full_pairs < rope_frequencies.shape[0] && factors[full_pairs] == 1.0f) full_pairs++;
+    int sliding_dim = w->layers[0].q_norm.shape[0], full_dim = w->layers[FULL_INTERVAL - 1].q_norm.shape[0];
+    Tensor sliding_cos, sliding_sin, full_cos, full_sin;
+    rope_table(&sliding_cos, &sliding_sin, sliding_dim, sliding_dim / 2, theta_sliding);
+    rope_table(&full_cos, &full_sin, full_dim, full_pairs, theta);
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        int full = layer % FULL_INTERVAL == FULL_INTERVAL - 1;
+        w->layers[layer].rope_cos = full ? full_cos : sliding_cos;
+        w->layers[layer].rope_sin = full ? full_sin : sliding_sin;
+    }
+
+    float *gelu = malloc(4096 * sizeof(float));
+    if (!gelu) { perror("malloc"); exit(1); }
+    for (int i = 0; i < 4096; i++) {
+        float x = -8.0f + 16.0f * (float)i / 4095.0f;
+        gelu[i] = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+    }
+    w->gelu_table = (Tensor){.data = gelu, .shape = {4096, -8, 8}};
+
+    pack_int8(&w->embed, w->embed.data, GGML_Q6_K);
+    pack_int8(&w->per_layer_model_projection, w->per_layer_model_projection.data, GGML_F16);
+    return model;
+}
+
 // Memory-maps a model file and rewrites its stored tensor offsets into pointers.
 Model *load_model(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -818,6 +1404,7 @@ Model *load_model(const char *path) {
     Model *model = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     close(fd);
     if (model == MAP_FAILED) { perror("mmap"); return NULL; }
+    if ((size_t)st.st_size >= 24 && !memcmp(model->magic, "GGUF", 4)) return load_gguf((const uint8_t *)model, (size_t)st.st_size, path);
     if (memcmp(model->magic, "MOG", 4) != 0) { fprintf(stderr, "%s: bad model file\n", path); return NULL; }
     Tensor *tensors = (Tensor *)&model->weights;
     for (size_t i = 0; i < sizeof(model->weights) / sizeof(*tensors); i++) {
