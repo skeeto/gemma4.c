@@ -18,7 +18,6 @@
 #include <strings.h>
 #include <sys/socket.h>
 
-#define FENCE "```tool_call"
 #define MAX_BODY (64 << 20)
 #define DEFAULT_MAX_NEW 4096
 #define MODEL_ID "gemma4"
@@ -320,12 +319,15 @@ void send_content(Client *client, const char *text, size_t len) {
 }
 
 // Sends a complete tool call in a single delta, which both harnesses accept.
-void send_tool_call(Client *client, const char *name, const char *arguments, size_t arguments_len) {
+void send_tool_call(Client *client, int index, const char *name, const char *arguments, size_t arguments_len) {
     static Buffer delta;
     buffer_clear(&delta);
     char id[32];
+    snprintf(id, sizeof(id), "%d", index);
+    append_str(&delta, "{\"tool_calls\":[{\"index\":");
+    append_str(&delta, id);
     snprintf(id, sizeof(id), "call_%d", call_counter++);
-    append_str(&delta, "{\"tool_calls\":[{\"index\":0,\"id\":\"");
+    append_str(&delta, ",\"id\":\"");
     append_str(&delta, id);
     append_str(&delta, "\",\"type\":\"function\",\"function\":{\"name\":\"");
     append_escaped(&delta, name, strlen(name));
@@ -346,177 +348,633 @@ void send_finish(Client *client, const char *finish, int prompt, int cached, int
 }
 
 // ----------------------------------------------------------------------------
-// Prompt construction
+// Prompt construction, following Gemma 4's own chat template
+//
+// The template renders the system text, thinking switch, and tool
+// declarations into a system turn, and tool calls and their results into
+// the model's turn with dedicated control tokens:
+//
+//   <|turn>system\n<|think|>\nSYSTEM<|tool>declaration:NAME{...}<tool|><turn|>\n
+//   <|turn>user\nTEXT<turn|>\n
+//   <|turn>model\n<|channel>thought\n...<channel|><|tool_call>call:NAME{k:v}<tool_call|>
+//   <|tool_response>response:NAME{value:<|"|>...<|"|>}<tool_response|>TEXT<turn|>\n
+//
+// Strings in that syntax are delimited by the <|"|> token rather than quoted.
+
+#define QUOTE "<|\"|>"
+
+enum { TOK_EOS = 1, TOK_TOOL_CALL = 48, TOK_TOOL_CALL_END = 49, TOK_TOOL_RESPONSE = 50,
+       TOK_QUOTE = 52, TOK_CHANNEL = 100, TOK_CHANNEL_END = 101, TOK_TURN_END = 106 };
 
 int token_ids[MAX_CONTEXT];
-int scratch_ids[MAX_CONTEXT];
 int tokens_total;
 int prev_ids[MAX_CONTEXT]; // Mirrors the token positions held by the KV cache.
 int prev_count;
 FILE *debug_file; // Set by GEMMA4_DEBUG=path to record request bodies and rendered prompts.
 
-// Appends one templated turn to the token sequence; fails on overflow.
-int push_turn(const Tokenizer *tokenizer, const char *prefix, const char *text, const char *suffix) {
-    if (debug_file) fprintf(debug_file, "%s%s%s", prefix, text ? text : "", suffix);
-    const char *segments[3] = {prefix, text ? text : "", suffix};
-    int count = tokenize(tokenizer, segments, scratch_ids, MAX_CONTEXT);
-    if (count < 0 || tokens_total + count - 1 > MAX_CONTEXT) return 0;
-    memcpy(token_ids + tokens_total, scratch_ids + 1, (count - 1) * sizeof(int)); // Skip the <bos> tokenize() prepends.
-    tokens_total += count - 1;
-    return 1;
+// The prompt as text, with a parallel mask marking the bytes where a control
+// token may begin. Message contents are raw, so text that merely looks like a
+// control token (a source file read by a tool, say) is tokenized as text.
+typedef struct {
+    Buffer text, mask;
+} Prompt;
+
+void put(Prompt *p, const char *s, size_t len, char syntax) {
+    append(&p->text, s, len);
+    buffer_grow(&p->mask, len);
+    memset(p->mask.data + p->mask.len, syntax, len);
+    p->mask.len += len;
 }
 
-// Renders the tool schemas and calling convention into system text.
-void render_tools(Buffer *out, const char *tools) {
-    append_str(out, "You can call tools. The available tools:\n\n");
-    for (const char *tool = json_first(tools); tool; tool = json_next(tool)) {
-        const char *function = json_get(tool, "function");
-        if (!function) continue;
-        append_str(out, "## ");
-        append_json_decoded(out, json_get(function, "name"));
-        append_str(out, "\n");
-        append_json_decoded(out, json_get(function, "description"));
-        const char *parameters = json_get(function, "parameters");
-        const char *end = parameters ? json_skip(parameters) : NULL;
-        if (end) {
-            append_str(out, "\nParameters (JSON schema): ");
-            append(out, parameters, (size_t)(end - parameters));
-        }
-        append_str(out, "\n\n");
-    }
-    append_str(out,
-        "To call a tool, end your reply with exactly one block of this form and write nothing after it:\n"
-        "```tool_call\n{\"name\": \"<tool name>\", \"arguments\": {<arguments matching the schema>}}\n```\n"
-        "The tool result will arrive in a <tool_response> block. "
-        "Reply in plain text when no tool is needed.\n");
+void syn(Prompt *p, const char *s) { put(p, s, strlen(s), 1); }
+void raw(Prompt *p, const char *s) { put(p, s, strlen(s), 0); }
+
+// Appends raw text with surrounding whitespace removed, as Jinja's trim.
+void raw_trimmed(Prompt *p, const char *s, size_t len) {
+    while (len && strchr(" \t\r\n", *s)) { s++; len--; }
+    while (len && strchr(" \t\r\n", s[len - 1])) len--;
+    put(p, s, len, 0);
 }
 
-// Builds the full token sequence for the conversation; returns an error string or NULL.
-const char *build_prompt(const Tokenizer *tokenizer, const char *body) {
-    static Buffer content, system_text;
-    const char *messages = json_get(body, "messages");
-    if (!json_first(messages)) return "request has no messages";
+void quoted(Prompt *p, const char *s, size_t len) {
+    syn(p, QUOTE);
+    put(p, s, len, 0);
+    syn(p, QUOTE);
+}
 
-    tokens_total = 1;
-    token_ids[0] = 2; // <bos>
+// Appends the decoded JSON string at value as a <|"|>-delimited string.
+void quoted_json(Prompt *p, const char *value) {
+    Buffer decoded = {0};
+    append_json_decoded(&decoded, value);
+    quoted(p, decoded.data ? decoded.data : "", decoded.len);
+    free(decoded.data);
+}
 
-    // System text and the tool preamble form one leading user turn.
-    buffer_clear(&system_text);
-    for (const char *msg = json_first(messages); msg; msg = json_next(msg)) {
-        const char *role = json_get(msg, "role");
-        if (json_streq(role, "system") || json_streq(role, "developer")) {
-            decode_content(json_get(msg, "content"), &content);
-            append(&system_text, content.data ? content.data : "", content.len);
-            append_str(&system_text, "\n\n");
-        }
-    }
-    const char *tools = json_get(body, "tools");
-    if (json_first(tools)) render_tools(&system_text, tools);
-    if (system_text.len && !push_turn(tokenizer, "<|turn>user\n", system_text.data, "<turn|>\n"))
-        return "prompt exceeds the context window: context_length_exceeded";
-
-    for (const char *msg = json_first(messages); msg; msg = json_next(msg)) {
-        const char *role = json_get(msg, "role");
-        int ok = 1;
-        if (json_streq(role, "user")) {
-            decode_content(json_get(msg, "content"), &content);
-            ok = push_turn(tokenizer, "<|turn>user\n", content.data, "<turn|>\n");
-        } else if (json_streq(role, "tool")) {
-            static Buffer wrapped;
-            buffer_clear(&wrapped);
-            append_str(&wrapped, "<tool_response id=\"");
-            append_json_decoded(&wrapped, json_get(msg, "tool_call_id"));
-            append_str(&wrapped, "\">\n");
-            decode_content(json_get(msg, "content"), &content);
-            append(&wrapped, content.data ? content.data : "", content.len);
-            append_str(&wrapped, "\n</tool_response>");
-            ok = push_turn(tokenizer, "<|turn>user\n", wrapped.data, "<turn|>\n");
-        } else if (json_streq(role, "assistant")) {
-            decode_content(json_get(msg, "content"), &content);
-            // Replay earlier tool calls in the same fenced form the model emitted.
-            for (const char *call = json_first(json_get(msg, "tool_calls")); call; call = json_next(call)) {
-                const char *function = json_get(call, "function");
-                if (!function) continue;
-                if (content.len && content.data[content.len - 1] != '\n') append_str(&content, "\n");
-                append_str(&content, "```tool_call\n{\"name\": \"");
-                append_json_decoded(&content, json_get(function, "name"));
-                append_str(&content, "\", \"arguments\": ");
-                size_t before = content.len;
-                append_json_decoded(&content, json_get(function, "arguments"));
-                if (content.len == before) append_str(&content, "{}");
-                append_str(&content, "}\n```\n");
+// Splits text at control tokens and applies BPE to each run between them,
+// as the reference tokenizer does. Returns the token count, or -1 on overflow.
+int tokenize_prompt(const Tokenizer *tokenizer, const Prompt *p, int *tokens, int capacity) {
+    const char *text = p->text.data;
+    size_t len = p->text.len;
+    int count = 0, run = 0; // run: where the current run of plain text began
+    for (size_t i = 0; i < len;) {
+        if (count + 4 >= capacity) return -1;
+        if (p->mask.data[i] && text[i] == '<') {
+            int special = -1;
+            size_t special_len = 0;
+            for (int k = 0; k < tokenizer->special_count; k++) {
+                size_t n = strlen(tokenizer->specials[k].token);
+                if (n > special_len && n <= len - i && !strncmp(text + i, tokenizer->specials[k].token, n)) {
+                    special = tokenizer->specials[k].id;
+                    special_len = n;
+                }
             }
-            ok = push_turn(tokenizer, "<|turn>model\n", content.data, "<turn|>\n");
+            if (special >= 0) {
+                count = run + apply_bpe_merges(tokenizer, tokens + run, count - run);
+                tokens[count++] = special;
+                run = count;
+                i += special_len;
+                continue;
+            }
         }
-        if (!ok) return "prompt exceeds the context window: context_length_exceeded";
+        char piece[8] = {0};
+        if (text[i] == ' ') { memcpy(piece, "\xE2\x96\x81", 3); i++; } // SentencePiece represents spaces with U+2581.
+        else {
+            piece[0] = text[i++];
+            if ((piece[0] & 0xC0) == 0xC0)
+                for (int k = 1; k < 4 && i < len && (text[i] & 0xC0) == 0x80; k++) piece[k] = text[i++];
+        }
+        const LookupEntry *entry = bsearch(piece, tokenizer->encode_vocab, tokenizer->encode_vocab_count,
+                                           sizeof(LookupEntry), compare_lookup_keys);
+        if (entry) { tokens[count++] = entry->result; continue; }
+        for (const unsigned char *byte = (const unsigned char *)piece; *byte; byte++)
+            tokens[count++] = 238 + *byte; // Byte tokens occupy IDs 238 through 493.
     }
-    if (!push_turn(tokenizer, "<|turn>model\n", "", "")) // Cue the model's reply.
-        return "prompt exceeds the context window: context_length_exceeded";
+    return run + apply_bpe_merges(tokenizer, tokens + run, count - run);
+}
+
+// One member of a JSON object.
+typedef struct {
+    char name[128];
+    const char *value;
+} Member;
+
+int compare_members(const void *a, const void *b) {
+    return strcmp(((const Member *)a)->name, ((const Member *)b)->name);
+}
+
+// Lists up to cap members of the object at obj, sorted by name when asked
+// (the template's dictsort), and returns how many.
+int json_members(const char *obj, Member *out, int cap, int sorted) {
+    if (!obj || *(obj = json_ws(obj)) != '{') return 0;
+    const char *s = json_ws(obj + 1);
+    int n = 0;
+    while (*s == '"' && n < cap) {
+        const char *end = json_skip(s);
+        if (!end || json_string(s, out[n].name, sizeof(out[n].name)) < 0) break;
+        s = json_ws(end);
+        if (*s++ != ':') break;
+        out[n++].value = json_ws(s);
+        if (!(s = json_skip(s))) break;
+        s = json_ws(s);
+        if (*s != ',') break;
+        s = json_ws(s + 1);
+    }
+    if (sorted) qsort(out, (size_t)n, sizeof(*out), compare_members);
+    return n;
+}
+
+int json_is(const char *value, char c) { return value && *json_ws(value) == c; }
+
+// Renders a JSON value in the template's syntax (its format_argument macro).
+void put_value(Prompt *p, const char *value, int escape_keys, int sorted) {
+    value = json_ws(value);
+    if (*value == '"') {
+        quoted_json(p, value);
+    } else if (*value == '{') {
+        Member members[64];
+        int n = json_members(value, members, 64, sorted);
+        syn(p, "{");
+        for (int i = 0; i < n; i++) {
+            if (i) syn(p, ",");
+            if (escape_keys) quoted(p, members[i].name, strlen(members[i].name));
+            else raw(p, members[i].name);
+            syn(p, ":");
+            put_value(p, members[i].value, escape_keys, sorted);
+        }
+        syn(p, "}");
+    } else if (*value == '[') {
+        syn(p, "[");
+        for (const char *item = json_first(value); item; item = json_next(item)) {
+            if (item != json_first(value)) syn(p, ",");
+            put_value(p, item, escape_keys, sorted);
+        }
+        syn(p, "]");
+    } else {
+        const char *end = json_skip(value);
+        put(p, value, end ? (size_t)(end - value) : 0, 0);
+    }
+}
+
+// The schema's type, upper-cased; for a list of types, the first not null.
+void schema_type(const char *type, char *out, size_t cap) {
+    out[0] = 0;
+    if (json_is(type, '[')) {
+        for (const char *t = json_first(type); t; t = json_next(t))
+            if (!json_streq(t, "null")) { type = t; break; }
+    }
+    if (json_string(type, out, cap) < 0) out[0] = 0;
+    for (char *c = out; *c; c++) if (*c >= 'a' && *c <= 'z') *c -= 32;
+}
+
+// Renders a schema's properties (the template's format_parameters macro).
+void put_parameters(Prompt *p, const char *properties) {
+    Member members[64];
+    int n = json_members(properties, members, 64, 1);
+    for (int i = 0; i < n; i++) {
+        const char *value = members[i].value;
+        int comma = 0;
+#define SEPARATE() do { if (comma) syn(p, ","); comma = 1; } while (0)
+        if (i) syn(p, ",");
+        raw(p, members[i].name);
+        syn(p, ":{");
+        const char *description = json_get(value, "description");
+        if (json_is(description, '"')) { syn(p, "description:"); quoted_json(p, description); comma = 1; }
+        char type[32];
+        schema_type(json_get(value, "type"), type, sizeof(type));
+        if (!strcmp(type, "STRING")) {
+            const char *options = json_get(value, "enum");
+            if (json_first(options)) { SEPARATE(); syn(p, "enum:"); put_value(p, options, 1, 1); }
+        } else if (!strcmp(type, "ARRAY")) {
+            Member items[16];
+            int item_count = json_members(json_get(value, "items"), items, 16, 1);
+            if (item_count) {
+                SEPARATE();
+                syn(p, "items:{");
+                int first = 1;
+                for (int k = 0; k < item_count; k++) {
+                    const char *item = items[k].value;
+                    if (!strncmp(item, "null", 4)) continue;
+                    if (!first) syn(p, ",");
+                    first = 0;
+                    if (!strcmp(items[k].name, "properties")) {
+                        syn(p, "properties:{");
+                        put_parameters(p, item);
+                        syn(p, "}");
+                    } else if (!strcmp(items[k].name, "type")) {
+                        char item_type[32];
+                        schema_type(item, item_type, sizeof(item_type));
+                        syn(p, "type:");
+                        quoted(p, item_type, strlen(item_type));
+                    } else {
+                        raw(p, items[k].name);
+                        syn(p, ":");
+                        put_value(p, item, 1, 1);
+                    }
+                }
+                syn(p, "}");
+            }
+        }
+        const char *nullable = json_get(value, "nullable");
+        if (nullable && !strncmp(json_ws(nullable), "true", 4)) { SEPARATE(); syn(p, "nullable:true"); }
+        if (!strcmp(type, "OBJECT")) {
+            const char *nested = json_get(value, "properties");
+            if (json_is(nested, '{')) { SEPARATE(); syn(p, "properties:{"); put_parameters(p, nested); syn(p, "}"); }
+            const char *required = json_get(value, "required");
+            if (json_first(required)) { SEPARATE(); syn(p, "required:"); put_value(p, required, 1, 0); }
+        }
+        SEPARATE();
+        syn(p, "type:");
+        quoted(p, type, strlen(type));
+        syn(p, "}");
+#undef SEPARATE
+    }
+}
+
+// Renders one tool declaration (the template's format_function_declaration).
+void put_tool(Prompt *p, const char *tool) {
+    const char *function = json_get(tool, "function");
+    if (!function) return;
+    syn(p, "<|tool>declaration:");
+    Buffer name = {0};
+    append_json_decoded(&name, json_get(function, "name"));
+    raw(p, name.data ? name.data : "");
+    free(name.data);
+    syn(p, "{description:");
+    const char *description = json_get(function, "description");
+    if (json_is(description, '"')) quoted_json(p, description);
+    else quoted(p, "", 0);
+    const char *parameters = json_get(function, "parameters");
+    if (json_is(parameters, '{')) {
+        syn(p, ",parameters:{");
+        const char *properties = json_get(parameters, "properties");
+        Member probe[1];
+        if (json_members(properties, probe, 1, 0)) {
+            syn(p, "properties:{");
+            put_parameters(p, properties);
+            syn(p, "},");
+        }
+        const char *required = json_get(parameters, "required");
+        if (json_first(required)) { syn(p, "required:"); put_value(p, required, 1, 0); syn(p, ","); }
+        char type[32];
+        schema_type(json_get(parameters, "type"), type, sizeof(type));
+        syn(p, "type:");
+        quoted(p, type[0] ? type : "OBJECT", strlen(type[0] ? type : "OBJECT"));
+        syn(p, "}");
+    }
+    syn(p, "}<tool|>");
+}
+
+// Whether the request asks for thinking: chat_template_kwargs.enable_thinking
+// if given, else any reasoning_effort but "none".
+int request_thinking(const char *body) {
+    const char *enable = json_get(json_get(body, "chat_template_kwargs"), "enable_thinking");
+    if (enable) return !strncmp(json_ws(enable), "true", 4);
+    char effort[32];
+    return json_string(json_get(body, "reasoning_effort"), effort, sizeof(effort)) >= 0 && strcmp(effort, "none");
+}
+
+int role_is(const char *msg, const char *a, const char *b) {
+    const char *role = json_get(msg, "role");
+    return json_streq(role, a) || (b && json_streq(role, b));
+}
+
+// Builds the token sequence for the conversation. Returns an error string or
+// NULL, and whether generation begins inside a thought channel.
+const char *build_prompt(const Tokenizer *tokenizer, const char *body, int thinking, int *in_thought) {
+    static Prompt p;
+    static Buffer content;
+    buffer_clear(&p.text);
+    buffer_clear(&p.mask);
+    *in_thought = 0;
+
+    int count = 0, cap = 0;
+    const char **messages = NULL;
+    for (const char *msg = json_first(json_get(body, "messages")); msg; msg = json_next(msg)) {
+        if (count == cap) {
+            cap = cap ? cap * 2 : 256;
+            messages = realloc(messages, (size_t)cap * sizeof(*messages));
+            if (!messages) { perror("realloc"); exit(1); }
+        }
+        messages[count++] = msg;
+    }
+    if (!count) return "request has no messages";
+
+    syn(&p, "<bos>");
+    const char *tools = json_get(body, "tools");
+    int start = role_is(messages[0], "system", "developer");
+    if (thinking || json_first(tools) || start) {
+        syn(&p, "<|turn>system\n");
+        if (thinking) syn(&p, "<|think|>\n");
+        if (start) {
+            decode_content(json_get(messages[0], "content"), &content);
+            raw_trimmed(&p, content.data ? content.data : "", content.len);
+        }
+        for (const char *tool = json_first(tools); tool; tool = json_next(tool)) put_tool(&p, tool);
+        syn(&p, "<turn|>\n");
+    }
+
+    int last_user = -1;
+    for (int i = start; i < count; i++)
+        if (role_is(messages[i], "user", NULL)) last_user = i;
+
+    int previous_assistant = 0, open_turn = 0;
+    for (int i = start; i < count; i++) {
+        const char *msg = messages[i];
+        if (role_is(msg, "tool", NULL)) continue; // Rendered with the call that asked for it.
+        if (!role_is(msg, "assistant", NULL)) {
+            syn(&p, role_is(msg, "user", NULL) ? "<|turn>user\n" : "<|turn>system\n");
+            decode_content(json_get(msg, "content"), &content);
+            raw_trimmed(&p, content.data ? content.data : "", content.len);
+            syn(&p, "<turn|>\n");
+            previous_assistant = 0;
+            continue;
+        }
+
+        if (!previous_assistant) syn(&p, "<|turn>model\n");
+        previous_assistant = 1;
+        // Thinking is kept only for the replies since the last user message.
+        const char *thought = json_get(msg, "reasoning_content");
+        if (!thought) thought = json_get(msg, "reasoning");
+        if (thought && i > last_user) {
+            decode_content(thought, &content);
+            if (content.len) {
+                syn(&p, "<|channel>thought\n");
+                raw_trimmed(&p, content.data, content.len);
+                syn(&p, "\n<channel|>");
+            }
+        }
+        // Unlike the template, text goes ahead of the calls, where the model
+        // wrote it, so that the KV cache matches what was generated.
+        decode_content(json_get(msg, "content"), &content);
+        raw_trimmed(&p, content.data ? content.data : "", content.len);
+
+        const char *calls = json_get(msg, "tool_calls");
+        for (const char *call = json_first(calls); call; call = json_next(call)) {
+            const char *function = json_get(call, "function");
+            syn(&p, "<|tool_call>call:");
+            Buffer name = {0}, arguments = {0};
+            append_json_decoded(&name, json_get(function, "name"));
+            raw(&p, name.data ? name.data : "");
+            append_json_decoded(&arguments, json_get(function, "arguments"));
+            put_value(&p, arguments.data && json_is(arguments.data, '{') ? arguments.data : "{}", 0, 0);
+            syn(&p, "<tool_call|>");
+            free(name.data);
+            free(arguments.data);
+        }
+
+        int responses = 0, next = i + 1;
+        for (; next < count && role_is(messages[next], "tool", NULL); next++) {
+            // The tool's name, by the id of the call it answers.
+            Buffer id = {0}, name = {0};
+            append_json_decoded(&id, json_get(messages[next], "tool_call_id"));
+            for (const char *call = json_first(calls); call; call = json_next(call)) {
+                Buffer call_id = {0};
+                append_json_decoded(&call_id, json_get(call, "id"));
+                if (id.data && call_id.data && !strcmp(id.data, call_id.data))
+                    append_json_decoded(&name, json_get(json_get(call, "function"), "name"));
+                free(call_id.data);
+            }
+            syn(&p, "<|tool_response>response:");
+            raw(&p, name.data ? name.data : "unknown");
+            syn(&p, "{value:");
+            decode_content(json_get(messages[next], "content"), &content);
+            quoted(&p, content.data ? content.data : "", content.len);
+            syn(&p, "}<tool_response|>");
+            free(id.data);
+            free(name.data);
+            responses = 1;
+        }
+        i = next - 1;
+
+        // Close the turn unless the reply continues: a following assistant
+        // message, or generation right after the tool results.
+        open_turn = 0;
+        if (next < count && role_is(messages[next], "assistant", NULL) && (!json_first(calls) || responses)) {
+        } else if (responses && next == count) {
+            open_turn = 1;
+        } else if (json_first(calls) && !responses) {
+            syn(&p, "<|tool_response>");
+        } else {
+            syn(&p, "<turn|>\n");
+            previous_assistant = 0;
+        }
+    }
+    free(messages);
+
+    if (!open_turn) syn(&p, "<|turn>model\n");
+    else if (thinking) { syn(&p, "<|channel>thought\n"); *in_thought = 1; }
+
+    if (debug_file) fwrite(p.text.data, 1, p.text.len, debug_file);
+    tokens_total = tokenize_prompt(tokenizer, &p, token_ids, MAX_CONTEXT);
+    if (tokens_total < 0) return "prompt exceeds the context window: context_length_exceeded";
     return NULL;
 }
 
 // ----------------------------------------------------------------------------
-// Generation with fence holdback
+// Tool calls in the model's output
+
+// Converts one value of the call syntax at *s to JSON, advancing *s.
+int call_value(const char **s, Buffer *out) {
+    const char *c = json_ws(*s);
+    size_t quote = strlen(QUOTE);
+    if (!strncmp(c, QUOTE, quote)) {
+        const char *end = strstr(c + quote, QUOTE);
+        if (!end) return 0;
+        append_str(out, "\"");
+        append_escaped(out, c + quote, (size_t)(end - c - quote));
+        append_str(out, "\"");
+        *s = end + quote;
+        return 1;
+    }
+    if (*c == '{' || *c == '[') {
+        int object = *c == '{';
+        char close = object ? '}' : ']';
+        append(out, c, 1);
+        c = json_ws(c + 1);
+        for (int first = 1; *c != close; first = 0) {
+            if (!first) {
+                if (*c != ',') return 0;
+                c = json_ws(c + 1);
+            }
+            append_str(out, first ? "" : ",");
+            if (object) {
+                const char *key = c, *key_end;
+                if (!strncmp(c, QUOTE, quote)) {
+                    key = c + quote;
+                    if (!(key_end = strstr(key, QUOTE))) return 0;
+                    c = key_end + quote;
+                } else {
+                    while (*c && *c != ':') c++;
+                    key_end = c;
+                    while (key_end > key && strchr(" \t\r\n", key_end[-1])) key_end--;
+                }
+                c = json_ws(c);
+                if (*c++ != ':') return 0;
+                append_str(out, "\"");
+                append_escaped(out, key, (size_t)(key_end - key));
+                append_str(out, "\":");
+            }
+            if (!call_value(&c, out)) return 0;
+            c = json_ws(c);
+        }
+        append(out, &close, 1);
+        *s = c + 1;
+        return 1;
+    }
+    // A bare literal: kept if it is valid JSON, else quoted as a string.
+    const char *end = c;
+    while (*end && !strchr(",}]", *end)) end++;
+    const char *last = end;
+    while (last > c && strchr(" \t\r\n", last[-1])) last--;
+    size_t len = (size_t)(last - c);
+    char *number_end;
+    int literal = (len == 4 && !strncmp(c, "true", 4)) || (len == 5 && !strncmp(c, "false", 5)) ||
+                  (len == 4 && !strncmp(c, "null", 4));
+    if (!literal && len) {
+        strtod(c, &number_end);
+        literal = number_end == last;
+    }
+    if (literal) append(out, c, len);
+    else { append_str(out, "\""); append_escaped(out, c, len); append_str(out, "\""); }
+    *s = end;
+    return 1;
+}
+
+// Parses call:NAME{key:value,...} into a name and a JSON arguments object.
+int parse_call(const char *text, char *name, size_t cap, Buffer *arguments) {
+    text = json_ws(text);
+    if (strncmp(text, "call:", 5)) return 0;
+    text += 5;
+    const char *brace = strchr(text, '{');
+    if (!brace || (size_t)(brace - text) >= cap) return 0;
+    memcpy(name, text, (size_t)(brace - text));
+    name[brace - text] = 0;
+    buffer_clear(arguments);
+    return call_value(&brace, arguments) && !*json_ws(brace);
+}
+
+// ----------------------------------------------------------------------------
+// Generation
 
 typedef struct {
     Client *client;
-    Buffer pending; // Text withheld because it may open a tool_call fence.
-    Buffer tool;    // Text captured after the fence marker.
-    int in_tool;
-    int tool_done;
+    int thought;      // inside a thought channel
+    int label;        // reading the channel's label, "thought\n"
+    int call;         // inside a tool call
+    Buffer text;      // the label, or the call, so far
+    int calls;        // tool calls sent
+    char names[64][128]; // the tools offered
+    int name_count;
 } Stream;
 
-void stream_check_close(Stream *stream) {
-    char *close = strstr(stream->tool.data ? stream->tool.data : "", "\n```");
-    if (!close) return;
-    stream->tool.len = (size_t)(close - stream->tool.data);
-    stream->tool.data[stream->tool.len] = 0;
-    stream->tool_done = 1;
+void send_delta(Client *client, const char *field, const char *text, size_t len) {
+    if (!len || client->failed) return;
+    static Buffer delta;
+    buffer_clear(&delta);
+    append_str(&delta, "{\"");
+    append_str(&delta, field);
+    append_str(&delta, "\":\"");
+    append_escaped(&delta, text, len);
+    append_str(&delta, "\"}");
+    send_chunk(client, delta.data, NULL, NULL);
 }
 
-void stream_text(Stream *stream, const char *text) {
-    if (stream->in_tool) {
-        append_str(&stream->tool, text);
-        stream_check_close(stream);
-        return;
-    }
-    append_str(&stream->pending, text);
-    char *fence = strstr(stream->pending.data, FENCE);
-    if (fence) {
-        send_content(stream->client, stream->pending.data, (size_t)(fence - stream->pending.data));
-        stream->in_tool = 1;
-        append_str(&stream->tool, fence + strlen(FENCE));
-        buffer_clear(&stream->pending);
-        stream_check_close(stream);
-        return;
-    }
-    // Flush all but the longest tail that could still begin the fence marker.
-    size_t keep = 0;
-    for (size_t k = strlen(FENCE) - 1; k > 0; k--)
-        if (stream->pending.len >= k && !strncmp(stream->pending.data + stream->pending.len - k, FENCE, k)) { keep = k; break; }
-    if (stream->pending.len > keep) {
-        send_content(stream->client, stream->pending.data, stream->pending.len - keep);
-        memmove(stream->pending.data, stream->pending.data + stream->pending.len - keep, keep);
-        stream->pending.len = keep;
-        stream->pending.data[keep] = 0;
-    }
+// llama.cpp's prefill progress, which Prospero shows with an ETA.
+void send_progress(Client *client, int total, int cached, int processed, double started) {
+    char frame[256];
+    int len = snprintf(frame, sizeof(frame),
+        "data: {\"id\":\"gemma4\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"" MODEL_ID "\",\"choices\":[],"
+        "\"prompt_progress\":{\"total\":%d,\"cache\":%d,\"processed\":%d,\"time_ms\":%d}}\n\n",
+        total, cached, processed, (int)((time_seconds() - started) * 1000));
+    send_all(client, frame, (size_t)len);
 }
 
-// Extracts name and the raw arguments object from the fenced block.
-int parse_tool_call(const char *text, char *name, size_t name_cap, const char **arguments, size_t *arguments_len) {
-    if (json_string(json_get(text, "name"), name, name_cap) < 0) return 0;
-    const char *value = json_get(text, "arguments");
-    const char *end = value ? json_skip(value) : NULL;
-    if (end) { *arguments = value; *arguments_len = (size_t)(end - value); }
-    else { *arguments = "{}"; *arguments_len = 2; }
-    return 1;
+// Handles one generated token. Returns nonzero when generation should stop.
+int stream_token(Stream *stream, const Tokenizer *tokenizer, int token) {
+    // The string delimiter decodes to nothing, but a call needs its text.
+    const char *text = token == TOK_QUOTE ? QUOTE : token_text(tokenizer, token);
+    switch (token) {
+    case TOK_EOS: case TOK_TURN_END: case TOK_TOOL_RESPONSE:
+        return 1;
+    case TOK_CHANNEL:
+        stream->thought = stream->label = 1;
+        buffer_clear(&stream->text);
+        return 0;
+    case TOK_CHANNEL_END:
+        if (stream->label) send_delta(stream->client, "reasoning_content", stream->text.data, stream->text.len);
+        stream->thought = stream->label = 0;
+        return 0;
+    case TOK_TOOL_CALL:
+        stream->thought = stream->label = 0;
+        stream->call = 1;
+        buffer_clear(&stream->text);
+        return 0;
+    case TOK_TOOL_CALL_END: {
+        stream->call = 0;
+        char name[128];
+        static Buffer arguments;
+        if (parse_call(stream->text.data ? stream->text.data : "", name, sizeof(name), &arguments)) {
+            send_tool_call(stream->client, stream->calls++, name, arguments.data, arguments.len);
+        } else { // Not a valid call after all: pass it on as text.
+            send_delta(stream->client, "content", "<|tool_call>", 12);
+            send_delta(stream->client, "content", stream->text.data, stream->text.len);
+            send_delta(stream->client, "content", "<tool_call|>", 12);
+        }
+        return 0;
+    }
+    }
+    if (stream->call) {
+        append_str(&stream->text, text);
+    } else if (stream->label) {
+        append_str(&stream->text, text);
+        char *newline = strchr(stream->text.data, '\n');
+        if (newline || stream->text.len > 16) {
+            stream->label = 0;
+            int named = newline && !strncmp(stream->text.data, "thought\n", 8);
+            const char *rest = named ? stream->text.data + 8 : stream->text.data;
+            send_delta(stream->client, "reasoning_content", rest, strlen(rest));
+        }
+    } else {
+        send_delta(stream->client, stream->thought ? "reasoning_content" : "content", text, strlen(text));
+    }
+    return 0;
+}
+
+// Whether token may extend a tool call's header, call:NAME{, to one of the
+// offered tools, given the header so far.
+int header_allows(const Stream *stream, const char *header, size_t header_len, const char *text) {
+    size_t text_len = strlen(text);
+    if (!text_len) return 0;
+    for (int i = 0; i < stream->name_count; i++) {
+        char target[160];
+        int target_len = snprintf(target, sizeof(target), "call:%s{", stream->names[i]);
+        if ((size_t)target_len <= header_len || strncmp(header, target, header_len)) continue;
+        size_t left = (size_t)target_len - header_len;
+        if (!strncmp(text, target + header_len, text_len < left ? text_len : left)) return 1;
+    }
+    return 0;
+}
+
+// Masks the logits so that the next token is one the protocol allows: a call
+// names an offered tool, and is closed before the turn ends.
+void constrain(Stream *stream, const Tokenizer *tokenizer, float *values) {
+    if (!stream->name_count) values[TOK_TOOL_CALL] = -INFINITY;
+    if (!stream->call) return;
+    values[TOK_EOS] = values[TOK_TURN_END] = values[TOK_TOOL_RESPONSE] = -INFINITY;
+    const char *header = stream->text.data ? stream->text.data : "";
+    if (strchr(header, '{')) return; // The name is settled.
+    size_t header_len = strlen(header);
+    for (int token = 0; token < VOCAB_SIZE; token++)
+        if (values[token] > -INFINITY && !header_allows(stream, header, header_len, token_text(tokenizer, token)))
+            values[token] = -INFINITY;
 }
 
 // ----------------------------------------------------------------------------
 // Request handling
 
 void handle_completion(Model *model, InferenceState *state, Client *client, const char *body) {
-    const char *error = build_prompt(&model->tokenizer, body);
+    int thinking = request_thinking(body), in_thought;
+    const char *error = build_prompt(&model->tokenizer, body, thinking, &in_thought);
     if (error) { http_error(client, 400, "Bad Request", error); return; }
     int prompt_tokens = tokens_total;
     float temperature = (float)json_number(json_get(body, "temperature"), 0.0);
@@ -538,7 +996,10 @@ void handle_completion(Model *model, InferenceState *state, Client *client, cons
         common = 0;
     // Prefill in chunks on the batch grid: sliding-cache writes are
     // contiguous, so a chunk starting off the grid could cross the wrap
-    // boundary. Between chunks, ping the client, and stop if it hung up.
+    // boundary. After each chunk, report progress, and stop if the client
+    // hung up.
+    double started = time_seconds();
+    send_progress(client, prompt_tokens, common, common, started);
     int done = common, last_index = 0;
     while (done < prompt_tokens && !client->failed) {
         int chunk = BATCH_SIZE - done % BATCH_SIZE;
@@ -546,7 +1007,7 @@ void handle_completion(Model *model, InferenceState *state, Client *client, cons
         forward(model, state, token_ids + done, chunk, done);
         done += chunk;
         last_index = chunk - 1;
-        keepalive(client);
+        send_progress(client, prompt_tokens, common, done, started);
     }
     if (client->failed) {
         // Keep what was prefilled, so a retry of this request resumes it.
@@ -555,49 +1016,46 @@ void handle_completion(Model *model, InferenceState *state, Client *client, cons
         fprintf(stderr, "%d prompt tokens (%d cached), client left after %d\n", prompt_tokens, common, done);
         return;
     }
+    double prefilled = time_seconds();
 
     if (debug_file) {
-        fprintf(debug_file, "prompt ids (common=%d):", common);
+        fprintf(debug_file, "\nprompt ids (common=%d):", common);
         for (int i = 0; i < prompt_tokens; i++) fprintf(debug_file, " %d", token_ids[i]);
-        fprintf(debug_file, "\ngenerated ids:");
+        fprintf(debug_file, "\ngenerated:");
     }
-    Stream stream = {.client = client};
-    buffer_clear(&stream.pending);
-    buffer_clear(&stream.tool);
+    static Stream stream;
+    buffer_clear(&stream.text);
+    stream.client = client;
+    stream.thought = in_thought;
+    stream.label = stream.call = stream.calls = stream.name_count = 0;
+    for (const char *tool = json_first(json_get(body, "tools")); tool && stream.name_count < 64; tool = json_next(tool))
+        if (json_string(json_get(json_get(tool, "function"), "name"), stream.names[stream.name_count], 128) > 0)
+            stream.name_count++;
+
     const char *finish = "length";
     int position = prompt_tokens;
     int end = prompt_tokens + max_new < MAX_CONTEXT ? prompt_tokens + max_new : MAX_CONTEXT;
     for (int first = 1; position < end && !client->failed; first = 0) {
-        int next = sample(logits(model, state, first ? last_index : 0), VOCAB_SIZE, temperature);
-        if (next == 1 || next == 106) { finish = "stop"; break; } // <eos> or <turn|>.
+        float *values = logits(model, state, first ? last_index : 0);
+        constrain(&stream, &model->tokenizer, values);
+        int next = sample(values, VOCAB_SIZE, temperature);
+        if (debug_file) fprintf(debug_file, "%s", next == TOK_QUOTE ? QUOTE : token_text(&model->tokenizer, next));
+        if (stream_token(&stream, &model->tokenizer, next)) { finish = "stop"; break; }
         forward(model, state, &next, 1, position);
         token_ids[position++] = next;
-        if (debug_file) fprintf(debug_file, " %d", next);
-        stream_text(&stream, token_text(&model->tokenizer, next));
-        if (stream.tool_done) { finish = "stop"; break; }
         keepalive(client);
     }
+    if (stream.calls) finish = "tool_calls";
+    else if (stream.call) send_delta(client, "content", stream.text.data, stream.text.len); // Cut off.
     prev_count = position;
     memcpy(prev_ids, token_ids, (size_t)position * sizeof(int));
-
-    if (stream.in_tool) {
-        char name[128];
-        const char *arguments;
-        size_t arguments_len;
-        if (parse_tool_call(stream.tool.data, name, sizeof(name), &arguments, &arguments_len)) {
-            send_tool_call(client, name, arguments, arguments_len);
-            finish = "tool_calls";
-        } else { // Not a valid call after all: emit the withheld text as content.
-            send_content(client, FENCE, strlen(FENCE));
-            send_content(client, stream.tool.data, stream.tool.len);
-        }
-    } else send_content(client, stream.pending.data, stream.pending.len);
     send_finish(client, finish, prompt_tokens, common, position - prompt_tokens);
 
-    fprintf(stderr, "%d prompt tokens (%d cached), %d generated, %s\n",
-            prompt_tokens, common, position - prompt_tokens, finish);
-    free(stream.pending.data);
-    free(stream.tool.data);
+    double finished = time_seconds();
+    int generated = position - prompt_tokens;
+    fprintf(stderr, "%d prompt tokens (%d cached, %.0f tok/s), %d generated (%.1f tok/s), %d calls, %s\n",
+            prompt_tokens, common, (prompt_tokens - common) / (prefilled - started + 1e-9),
+            generated, generated / (finished - prefilled + 1e-9), stream.calls, finish);
 }
 
 void handle_connection(Model *model, InferenceState *state, int socket_fd) {
