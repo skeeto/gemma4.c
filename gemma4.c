@@ -883,91 +883,117 @@ void dequantize_q6_K(float *output, const void *blocks, int width, float multipl
     }
 }
 
-// Multiplies int8 activations, quantized in groups of 64, by q4_0 weights in
-// blocks of 32: each block's integer dot product is scaled by the weight
-// block's scale and its activation group's. A tile of four output rows is
-// unpacked once per block and reused across a few input rows.
+// Multiplies int8 activations, quantized in groups of 64, by q4_0 weights
+// rearranged at load (pack_q4) so that every 16 bytes hold 4 consecutive
+// inputs for 8 output rows: rows 0-3 in the low nibbles, rows 4-7 in the
+// high. One unpacked vector then serves a whole tile of tokens, and each
+// row's dot product builds up in its own lane, with no horizontal sums.
+// Per 8-row group and 32-input block: 8 such chunks, then elsewhere 8 f16
+// scales, one per row.
+#define Q4_ROWS 8
+
 #if defined(__ARM_NEON)
-#define Q4_TILE_INPUTS 4
-static inline __attribute__((always_inline)) void matmul_q4_0_tile(
+#define Q4_TILE 4
+static inline __attribute__((always_inline)) void matmul_q4_group(
     float *output, const int8_t *input_q, const float *input_scales,
-    const Tensor *weight, size_t rows, size_t first_output) {
+    const Tensor *weight, size_t first_token, int tokens, size_t group) {
     size_t width = (size_t)weight->shape[1], blocks = width / 32, groups = width / 64;
-    const BlockQ4_0 *weights = (const BlockQ4_0 *)weight->data + first_output * blocks;
-    for (size_t row_start = 0; row_start < rows; row_start += Q4_TILE_INPUTS) {
-        size_t active_rows = rows - row_start < Q4_TILE_INPUTS ? rows - row_start : Q4_TILE_INPUTS;
-        float32x4_t sum[Q4_TILE_INPUTS][4] = {0};
-        for (size_t b = 0; b < blocks; b++) {
-            int8x16_t low[4], high[4];
-            float weight_scale[4];
-            for (int o = 0; o < 4; o++) {
-                const BlockQ4_0 *block = &weights[o * blocks + b];
-                uint8x16_t packed = vld1q_u8(block->values);
-                low[o] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0xF))), vdupq_n_s8(8));
-                high[o] = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), vdupq_n_s8(8));
-                weight_scale[o] = half_to_float(block->scale);
-            }
-            for (size_t row = 0; row < active_rows; row++) {
-                const int8_t *input = input_q + (row_start + row) * width + b * 32;
-                int8x16_t first = vld1q_s8(input), second = vld1q_s8(input + 16);
-                float input_scale = input_scales[(row_start + row) * groups + b / 2];
-                for (int o = 0; o < 4; o++) {
-                    int32x4_t dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), low[o], first), high[o], second);
-                    sum[row][o] = vfmaq_n_f32(sum[row][o], vcvtq_f32_s32(dot), weight_scale[o] * input_scale);
-                }
-            }
+    const uint8_t *packed = (const uint8_t *)weight->data + group * blocks * 128;
+    const float16_t *scales = (const float16_t *)weight->scales + group * blocks * 8;
+    const int8_t *input = input_q + first_token * width;
+    const float *input_scale = input_scales + first_token * groups;
+    float32x4_t low_sum[Q4_TILE], high_sum[Q4_TILE];
+    for (int t = 0; t < tokens; t++) low_sum[t] = high_sum[t] = vdupq_n_f32(0.0f);
+    for (size_t b = 0; b < blocks; b++) {
+        int32x4_t low_dot[Q4_TILE], high_dot[Q4_TILE];
+        for (int t = 0; t < tokens; t++) low_dot[t] = high_dot[t] = vdupq_n_s32(0);
+        int8x16_t low[8], high[8];
+        for (int c = 0; c < 8; c++) {
+            uint8x16_t p = vld1q_u8(packed + b * 128 + c * 16);
+            low[c] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, vdupq_n_u8(0xF))), vdupq_n_s8(8));
+            high[c] = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), vdupq_n_s8(8));
         }
-        for (size_t row = 0; row < active_rows; row++)
-            for (int o = 0; o < 4; o++)
-                output[(row_start + row) * weight->shape[0] + first_output + o] = vaddvq_f32(sum[row][o]);
+        for (int t = 0; t < tokens; t++) {
+            int8x16_t first = vld1q_s8(input + t * width + b * 32), second = vld1q_s8(input + t * width + b * 32 + 16);
+#define Q4_LANE(c, half, lane) \
+            low_dot[t] = vdotq_laneq_s32(low_dot[t], low[c], half, lane); \
+            high_dot[t] = vdotq_laneq_s32(high_dot[t], high[c], half, lane);
+            Q4_LANE(0, first, 0) Q4_LANE(1, first, 1) Q4_LANE(2, first, 2) Q4_LANE(3, first, 3)
+            Q4_LANE(4, second, 0) Q4_LANE(5, second, 1) Q4_LANE(6, second, 2) Q4_LANE(7, second, 3)
+#undef Q4_LANE
+        }
+        float32x4_t low_scale = vcvt_f32_f16(vld1_f16(scales + b * 8));
+        float32x4_t high_scale = vcvt_f32_f16(vld1_f16(scales + b * 8 + 4));
+        for (int t = 0; t < tokens; t++) {
+            float s = input_scale[t * groups + b / 2];
+            low_sum[t] = vfmaq_f32(low_sum[t], vcvtq_f32_s32(low_dot[t]), vmulq_n_f32(low_scale, s));
+            high_sum[t] = vfmaq_f32(high_sum[t], vcvtq_f32_s32(high_dot[t]), vmulq_n_f32(high_scale, s));
+        }
+    }
+    for (int t = 0; t < tokens; t++) {
+        float *out = output + (first_token + t) * weight->shape[0] + group * Q4_ROWS;
+        vst1q_f32(out, low_sum[t]);
+        vst1q_f32(out + 4, high_sum[t]);
     }
 }
 #else
-#define Q4_TILE_INPUTS 2
-static inline __attribute__((always_inline)) void matmul_q4_0_tile(
+#define Q4_TILE 6
+// maddubs needs one unsigned operand: the weights' magnitudes, with their
+// signs moved onto the activations. Its 16-bit sums cannot saturate within
+// a block (8 chunks of at most 2 * 8 * 127).
+static inline __attribute__((always_inline)) void matmul_q4_group(
     float *output, const int8_t *input_q, const float *input_scales,
-    const Tensor *weight, size_t rows, size_t first_output) {
+    const Tensor *weight, size_t first_token, int tokens, size_t group) {
     size_t width = (size_t)weight->shape[1], blocks = width / 32, groups = width / 64;
-    const BlockQ4_0 *weights = (const BlockQ4_0 *)weight->data + first_output * blocks;
-    for (size_t row_start = 0; row_start < rows; row_start += Q4_TILE_INPUTS) {
-        size_t active_rows = rows - row_start < Q4_TILE_INPUTS ? rows - row_start : Q4_TILE_INPUTS;
-        __m256 sum[Q4_TILE_INPUTS][4] = {0};
-        for (size_t b = 0; b < blocks; b++) {
-            __m256i values[4], magnitudes[4];
-            float weight_scale[4];
-            for (int o = 0; o < 4; o++) {
-                const BlockQ4_0 *block = &weights[o * blocks + b];
-                __m128i packed = _mm_loadu_si128((const __m128i *)block->values);
-                __m128i low = _mm_and_si128(packed, _mm_set1_epi8(0xF));
-                __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(0xF));
-                values[o] = _mm256_sub_epi8(_mm256_set_m128i(high, low), _mm256_set1_epi8(8));
-                magnitudes[o] = _mm256_abs_epi8(values[o]);
-                weight_scale[o] = half_to_float(block->scale);
-            }
-            for (size_t row = 0; row < active_rows; row++) {
-                __m256i input = _mm256_loadu_si256((const __m256i *)(input_q + (row_start + row) * width + b * 32));
-                float input_scale = input_scales[(row_start + row) * groups + b / 2];
-                for (int o = 0; o < 4; o++) {
-                    __m256i dot = _mm256_madd_epi16(_mm256_maddubs_epi16(magnitudes[o], _mm256_sign_epi8(input, values[o])), _mm256_set1_epi16(1));
-                    sum[row][o] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(weight_scale[o] * input_scale), sum[row][o]);
-                }
+    const uint8_t *packed = (const uint8_t *)weight->data + group * blocks * 128;
+    const uint16_t *scales = weight->scales + group * blocks * 8;
+    const int8_t *input = input_q + first_token * width;
+    const float *input_scale = input_scales + first_token * groups;
+    __m256 sum[Q4_TILE];
+    for (int t = 0; t < tokens; t++) sum[t] = _mm256_setzero_ps();
+    for (size_t b = 0; b < blocks; b++) {
+        __m256i dot[Q4_TILE];
+        for (int t = 0; t < tokens; t++) dot[t] = _mm256_setzero_si256();
+        for (int c = 0; c < 8; c++) {
+            __m128i p = _mm_loadu_si128((const __m128i *)(packed + b * 128 + c * 16));
+            __m128i low = _mm_and_si128(p, _mm_set1_epi8(0xF));
+            __m128i high = _mm_and_si128(_mm_srli_epi16(p, 4), _mm_set1_epi8(0xF));
+            __m256i w = _mm256_sub_epi8(_mm256_set_m128i(high, low), _mm256_set1_epi8(8));
+            __m256i magnitude = _mm256_abs_epi8(w);
+            for (int t = 0; t < tokens; t++) {
+                int32_t four;
+                memcpy(&four, input + t * width + b * 32 + c * 4, 4);
+                __m256i a = _mm256_sign_epi8(_mm256_set1_epi32(four), w);
+                dot[t] = _mm256_add_epi16(dot[t], _mm256_maddubs_epi16(magnitude, a));
             }
         }
-        for (size_t row = 0; row < active_rows; row++)
-            for (int o = 0; o < 4; o++) {
-                __m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(sum[row][o]), _mm256_extractf128_ps(sum[row][o], 1));
-                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
-                output[(row_start + row) * weight->shape[0] + first_output + o] = _mm_cvtss_f32(_mm_add_ss(sum4, _mm_movehdup_ps(sum4)));
-            }
+        __m256 scale = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(scales + b * 8)));
+        for (int t = 0; t < tokens; t++) {
+            __m256 d = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot[t], _mm256_set1_epi16(1)));
+            sum[t] = _mm256_fmadd_ps(d, _mm256_mul_ps(scale, _mm256_set1_ps(input_scale[t * groups + b / 2])), sum[t]);
+        }
     }
+    for (int t = 0; t < tokens; t++)
+        _mm256_storeu_ps(output + (first_token + t) * weight->shape[0] + group * Q4_ROWS, sum[t]);
 }
 #endif
 
+// Each thread keeps its share of the row groups and walks the tokens a tile
+// at a time, so a tile's activations stay in L1 while its weights stream
+// from L2. Called inside a parallel region; ends with a barrier like omp for.
 void matmul_q4_0(float *output, const int8_t *input_q, const float *input_scales,
                  const Tensor *weight, size_t rows) {
-    #pragma omp for schedule(static)
-    for (size_t tile = 0; tile < (size_t)weight->shape[0] / 4; tile++)
-        matmul_q4_0_tile(output, input_q, input_scales, weight, rows, tile * 4);
+    size_t total = (size_t)weight->shape[0] / Q4_ROWS;
+    size_t threads = (size_t)omp_get_num_threads(), id = (size_t)omp_get_thread_num();
+    size_t first = total * id / threads, last = total * (id + 1) / threads;
+    size_t token = 0;
+    for (; token + Q4_TILE <= rows; token += Q4_TILE)
+        for (size_t group = first; group < last; group++)
+            matmul_q4_group(output, input_q, input_scales, weight, token, Q4_TILE, group);
+    for (; token < rows; token++)
+        for (size_t group = first; group < last; group++)
+            matmul_q4_group(output, input_q, input_scales, weight, token, 1, group);
+    #pragma omp barrier
 }
 
 // A cursor over the file, which flags rather than overruns a truncated one.
@@ -1041,6 +1067,34 @@ static const GgufTensor *find_tensor(TensorIndex *index, const char *name) {
     return NULL;
 }
 
+// Rearranges q4_0 blocks into matmul_q4_0's layout: for each group of 8
+// rows and block of 32 inputs, chunk c's byte j holds input c*4 + j%4 of row
+// j/4 in its low nibble and of row 4 + j/4 in its high nibble.
+static void pack_q4(Tensor *t) {
+    size_t groups = (size_t)t->shape[0] / Q4_ROWS, blocks = (size_t)t->shape[1] / 32;
+    const BlockQ4_0 *source = t->data;
+    uint8_t *packed = malloc(groups * blocks * 128);
+    uint16_t *scales = malloc(groups * blocks * Q4_ROWS * sizeof(*scales));
+    if (!packed || !scales) { perror("malloc"); exit(1); }
+    #pragma omp parallel for num_threads(thread_count()) schedule(static)
+    for (size_t g = 0; g < groups; g++)
+        for (size_t b = 0; b < blocks; b++) {
+            uint8_t *out = packed + (g * blocks + b) * 128;
+            for (int r = 0; r < Q4_ROWS; r++) scales[(g * blocks + b) * Q4_ROWS + r] = source[(g * Q4_ROWS + r) * blocks + b].scale;
+            for (int c = 0; c < 8; c++)
+                for (int j = 0; j < 16; j++) {
+                    int input = c * 4 + j % 4;
+                    const BlockQ4_0 *low = &source[(g * Q4_ROWS + j / 4) * blocks + b];
+                    const BlockQ4_0 *high = &source[(g * Q4_ROWS + 4 + j / 4) * blocks + b];
+                    int low_nibble = input < 16 ? low->values[input] & 15 : low->values[input - 16] >> 4;
+                    int high_nibble = input < 16 ? high->values[input] & 15 : high->values[input - 16] >> 4;
+                    out[c * 16 + j] = (uint8_t)(low_nibble | high_nibble << 4);
+                }
+        }
+    t->data = packed;
+    t->scales = scales;
+}
+
 // Points t at a tensor of the given type and shape (outputs, inputs; inputs
 // only for a vector), or leaves it empty when optional and absent.
 static void bind_tensor(TensorIndex *index, Tensor *t, const char *name, uint32_t type, int optional) {
@@ -1054,6 +1108,14 @@ static void bind_tensor(TensorIndex *index, Tensor *t, const char *name, uint32_
     t->shape[0] = g->dim_count > 1 ? g->dims[1] : g->dims[0]; // GGUF lists the innermost dimension first.
     t->shape[1] = g->dim_count > 1 ? g->dims[0] : 0;
     t->type = type == GGML_Q4_0 ? TENSOR_Q4_0 : type == GGML_Q6_K ? TENSOR_Q6_K : TENSOR_PACKED;
+    if (type == GGML_Q4_0) {
+        if (t->shape[0] % Q4_ROWS || t->shape[1] % 64) {
+            fprintf(stderr, "%s: tensor %s has an unsupported shape\n", index->path, name);
+            index->missing = 1;
+            return;
+        }
+        pack_q4(t);
+    }
 }
 
 // Converts a matrix, one source row at a time, to the exporter's packed int8

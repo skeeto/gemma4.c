@@ -197,12 +197,12 @@ int8 model:
 | Model | Top-1 agreement | Mean KL |
 | ----- | --------------: | ------: |
 | Google's GGUF | 88.4% | 0.0494 |
-| Refitted GGUF | 96.6% | 0.0048 |
+| Refitted GGUF | 97.2% | 0.0047 |
 
 For comparison, the int8 model agrees with the BF16 reference 96.5% of the
 time (mean KL 0.0052). On an i9-12900 under Windows 11 (AVX2, default
-threads), the refitted GGUF measures 99 tok/s prefill and 12.4 tok/s
-decode; on an M4 Max, 288 and 23.7.
+threads), the refitted GGUF measures 210 tok/s prefill and 13.2 tok/s
+decode; on an M4 Max, 450 and 25.0.
 
 ## Numerical validation
 
