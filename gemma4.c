@@ -1422,6 +1422,7 @@ Model *load_model(const char *path) {
 int main(int argc, char **argv) {
 #ifdef _WIN32
     argv_utf8(&argc, &argv);
+    disable_power_throttling();
 #endif
     const char *model_path = MODEL_FILE;
     const char *prompt = "Why is the sky blue?";

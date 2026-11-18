@@ -1,3 +1,5 @@
+// For SetProcessInformation and power throttling, Windows 10 and later.
+#define _WIN32_WINNT 0x0A00
 #include "win.h"
 
 #include <errno.h>
@@ -53,4 +55,14 @@ int munmap(void *address, size_t length) {
     if (UnmapViewOfFile(address)) return 0;
     errno = EIO;
     return -1;
+}
+
+// Windows 11 throttles a process it judges to be in the background, such as
+// one started without a window or over SSH, onto efficiency cores at low
+// clocks a few seconds in, which cut decoding to a third on an i9-12900.
+// Inference is the work the user is waiting for, so opt out.
+void disable_power_throttling(void) {
+    PROCESS_POWER_THROTTLING_STATE state = {
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
 }

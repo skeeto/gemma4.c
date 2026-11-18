@@ -164,29 +164,45 @@ Python is only needed to export the model or run numerical validation. Once the 
 
 ## GGUF model
 
-E2B builds also load Google's quantization-aware q4_0 GGUF, a 3.35 GB
-download, given its path with `-m`:
+E2B builds also load a q4_0 GGUF of Google's quantization-aware checkpoint,
+a 3.35 GB file, given its path with `-m`. Google publishes one, but its q4_0
+values are not the trained ones: the QAT weights lie exactly on a 4-bit
+grid, each block of 32 with its own step, which its quantization (the
+block's largest value over -8) misses by 5% in every matrix. `refit.py`
+rewrites its q4_0 blocks from the checkpoint with each block's fitted step
+(0.14% off, bf16 rounding), leaving the rest of the file as it is:
 
 ```bash
 hf download google/gemma-4-E2B-it-qat-q4_0-gguf gemma-4-E2B_q4_0-it.gguf \
   --revision 675cff42a74c774d6cb76f76d8eacb49b48c9b93 --local-dir .
-./run -m gemma-4-E2B_q4_0-it.gguf -t 0 "Why is the sky blue?"
+hf download google/gemma-4-E2B-it-qat-q4_0-unquantized \
+  --revision 6befbaca7398925921802abd1f277b495b78b738 \
+  --local-dir gemma-4-E2B-it-qat-q4_0-unquantized
+python3 refit.py gemma-4-E2B_q4_0-it.gguf \
+  gemma-4-E2B-it-qat-q4_0-unquantized/model.safetensors \
+  -o gemma-4-E2B-it-qat-q4_0-refit.gguf
+./run -m gemma-4-E2B-it-qat-q4_0-refit.gguf -t 0 "Why is the sky blue?"
 ```
 
-Only that file is supported, not GGUF in general. Its transformer matrices
-are q4_0 and are multiplied in place; its q6_K per-layer embedding table is
-read a row at a time; the q6_K token table, which is also the output
-projection, and the f16 per-layer projection are converted to int8 at load.
-The tokenizer built from its metadata is identical to the exported one.
+Only that file's layout is supported, not GGUF in general. Its transformer
+matrices are q4_0 and are multiplied in place; its q6_K per-layer embedding
+table is read a row at a time; the q6_K token table, which is also the
+output projection, and the f16 per-layer projection are converted to int8
+at load. The tokenizer built from its metadata is identical to the
+exported one.
 
-Its q4_0 values are not exactly the trained ones. The QAT checkpoints'
-weights (checked on E4B's) lie exactly on a 4-bit grid, but with each
-block's own step, which
-the GGUF's quantization (the block's largest value over -8) does not
-recover, for a 5% relative error in every matrix. Over the first 1,003
-positions of the validation article, it agrees with the int8 model on the
-top token 88.4% of the time (mean KL 0.049); with the int8 model's
-transformer matrices swapped in, 97.8%.
+Over the first 1,003 positions of the validation article, against the
+int8 model:
+
+| Model | Top-1 agreement | Mean KL |
+| ----- | --------------: | ------: |
+| Google's GGUF | 88.4% | 0.0494 |
+| Refitted GGUF | 96.6% | 0.0048 |
+
+For comparison, the int8 model agrees with the BF16 reference 96.5% of the
+time (mean KL 0.0052). On an i9-12900 under Windows 11 (AVX2, default
+threads), the refitted GGUF measures 99 tok/s prefill and 12.4 tok/s
+decode; on an M4 Max, 288 and 23.7.
 
 ## Numerical validation
 
